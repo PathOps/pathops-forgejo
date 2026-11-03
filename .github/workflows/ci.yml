@@ -1,0 +1,37 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Prepare pinned upstream Forgejo and apply patches
+        run: scripts/prepare-source.sh
+
+      - name: Set up Go (version from upstream go.mod)
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: .work/forgejo/go.mod
+          cache-dependency-path: .work/forgejo/go.sum
+
+      - name: Test
+        run: scripts/test.sh
+        env:
+          SKIP_PREPARE: "1"

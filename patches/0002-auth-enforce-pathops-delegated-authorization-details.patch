@@ -1,0 +1,774 @@
+From c0df126dc052ad29b558d8ac2574f64c84cfc6de Mon Sep 17 00:00:00 2001
+From: PathOps <noreply@pathops.dev>
+Date: Tue, 3 Nov 2026 09:33:14 -0300
+Subject: [PATCH 2/2] auth: enforce PathOps delegated authorization_details on
+ the API
+
+Tokens of the configured PathOps delegation issuer
+([authorized_integration] PATHOPS_DELEGATION_ISSUER) are tokens the PathOps
+Tenant Control Plane derived from one operation a user approved (PathOps
+Decision 0050). Their Authorized Integration needs a broad scope (personal
+repositories need write:user and write:repository), so the scope is not
+the boundary; their RAR authorization_details are:
+
+- such a token is accepted only when its integration pins sub and azp with
+  equality rules, its azp is PATHOPS_DELEGATION_AUTHORIZED_PARTY, and the
+  request is an API v1 request (never web, git, LFS or packages);
+- its authorization_details must parse as the PathOps forgejo vocabulary
+  (pathops_repository create/seed, pathops_webhook configure);
+- every API request is then allowed only when a detail authorizes exactly
+  its action on its owner/repository (and, for webhooks, its target URL and
+  events); anything else gets 403 before a handler runs.
+
+A token for gaston/app-a cannot create, read or change gaston/app-b, a
+repository token cannot touch webhooks and a webhook token cannot create or
+delete repositories. Without the setting, behavior is unchanged.
+---
+ modules/setting/authorized_integration.go     |  11 +
+ routers/api/shared/middleware.go              |  15 +
+ .../auth_result_authorized_integration.go     |   8 +
+ .../auth/method/authorized_integration.go     |  41 +++
+ .../authorized_integration_pathops_test.go    |  87 +++++
+ services/auth/pathops/pathops.go              | 309 ++++++++++++++++++
+ services/auth/pathops/pathops_test.go         | 158 +++++++++
+ 7 files changed, 629 insertions(+)
+ create mode 100644 services/auth/method/authorized_integration_pathops_test.go
+ create mode 100644 services/auth/pathops/pathops.go
+ create mode 100644 services/auth/pathops/pathops_test.go
+
+diff --git a/modules/setting/authorized_integration.go b/modules/setting/authorized_integration.go
+index 8bee9b4..d8e486d 100644
+--- a/modules/setting/authorized_integration.go
++++ b/modules/setting/authorized_integration.go
+@@ -11,6 +11,15 @@ var AuthorizedIntegration = struct {
+ 	AllowLocalNetworks bool
+ 	RequestTimeout     time.Duration
+ 	CacheTTL           time.Duration
++
++	// PathOpsDelegationIssuer is the issuer (the PathOps Cell's Dex) whose
++	// tokens carry PathOps operation-scoped authorization_details; empty:
++	// disabled. Its tokens are accepted only by the API, only from
++	// PathOpsDelegationAuthorizedParty (their azp), only through an
++	// integration that pins sub and azp, and only for what their details
++	// authorize (services/auth/pathops).
++	PathOpsDelegationIssuer          string
++	PathOpsDelegationAuthorizedParty string
+ }{}
+ 
+ func loadAuthorizedIntegrationFrom(rootCfg ConfigProvider) {
+@@ -20,6 +29,8 @@ func loadAuthorizedIntegrationFrom(rootCfg ConfigProvider) {
+ 	AuthorizedIntegration.AllowLocalNetworks = sec.Key("ALLOW_LOCALNETWORKS").MustBool(false)
+ 	AuthorizedIntegration.RequestTimeout = sec.Key("REQUEST_TIMEOUT").MustDuration(10 * time.Second)
+ 	AuthorizedIntegration.CacheTTL = sec.Key("CACHE_TTL").MustDuration(10 * time.Minute)
++	AuthorizedIntegration.PathOpsDelegationIssuer = sec.Key("PATHOPS_DELEGATION_ISSUER").MustString("")
++	AuthorizedIntegration.PathOpsDelegationAuthorizedParty = sec.Key("PATHOPS_DELEGATION_AUTHORIZED_PARTY").MustString("")
+ }
+ 
+ // LoadAuthorizedIntegrationSetting loads the [authorized_integration] section
+diff --git a/routers/api/shared/middleware.go b/routers/api/shared/middleware.go
+index c40c669..98b4368 100644
+--- a/routers/api/shared/middleware.go
++++ b/routers/api/shared/middleware.go
+@@ -16,6 +16,7 @@ import (
+ 	"forgejo.org/routers/common"
+ 	"forgejo.org/services/auth"
+ 	auth_method "forgejo.org/services/auth/method"
++	"forgejo.org/services/auth/pathops"
+ 	"forgejo.org/services/context"
+ 
+ 	"github.com/go-chi/cors"
+@@ -40,6 +41,7 @@ func Middlewares() (stack []any) {
+ 		// Get user from session if logged in.
+ 		apiAuthentication(buildAuthGroup()),
+ 		apiAuthorization(),
++		pathopsDelegation,
+ 		verifyAuthWithOptions(&common.VerifyOptions{
+ 			SignInRequired: func() bool { return setting.Service.RequireSignInView },
+ 		}),
+@@ -203,3 +205,16 @@ func securityHeaders() func(http.Handler) http.Handler {
+ 		})
+ 	}
+ }
++
++// pathopsDelegation refuses every request a PathOps delegated token's
++// authorization_details do not authorize, before any handler runs.
++func pathopsDelegation(ctx *context.APIContext) {
++	ar, ok := ctx.Authentication().(interface{ PathOpsDelegation() *pathops.Delegation })
++	if !ok || ar.PathOpsDelegation() == nil || ctx.Doer() == nil {
++		return
++	}
++	if err := ar.PathOpsDelegation().Authorize(ctx.Req, ctx.Doer().LowerName, setting.AppSubURL+"/api/v1"); err != nil {
++		log.Info("PathOps delegation refused %s %s for %s: %v", ctx.Req.Method, ctx.Req.URL.Path, ctx.Doer().Name, err)
++		ctx.Error(http.StatusForbidden, "PathOpsDelegation", err)
++	}
++}
+diff --git a/services/auth/method/auth_result_authorized_integration.go b/services/auth/method/auth_result_authorized_integration.go
+index aed06e7..7e3e527 100644
+--- a/services/auth/method/auth_result_authorized_integration.go
++++ b/services/auth/method/auth_result_authorized_integration.go
+@@ -9,6 +9,7 @@ import (
+ 	"forgejo.org/modules/optional"
+ 	"forgejo.org/modules/timeutil"
+ 	"forgejo.org/services/auth"
++	"forgejo.org/services/auth/pathops"
+ 	"forgejo.org/services/authz"
+ )
+ 
+@@ -20,6 +21,13 @@ type authorizedIntegrationAuthenticationResult struct {
+ 	scope     auth_model.AccessTokenScope
+ 	reducer   authz.AuthorizationReducer
+ 	expiresAt optional.Option[timeutil.TimeStamp]
++	pathops   *pathops.Delegation
++}
++
++// PathOpsDelegation is the token's PathOps authority (nil for other tokens);
++// the API refuses every request it does not authorize.
++func (r *authorizedIntegrationAuthenticationResult) PathOpsDelegation() *pathops.Delegation {
++	return r.pathops
+ }
+ 
+ func (r *authorizedIntegrationAuthenticationResult) User() *user_model.User {
+diff --git a/services/auth/method/authorized_integration.go b/services/auth/method/authorized_integration.go
+index 0f0c18d..6eab08d 100644
+--- a/services/auth/method/authorized_integration.go
++++ b/services/auth/method/authorized_integration.go
+@@ -21,6 +21,7 @@ import (
+ 	"forgejo.org/modules/timeutil"
+ 	"forgejo.org/modules/util"
+ 	auth_service "forgejo.org/services/auth"
++	"forgejo.org/services/auth/pathops"
+ 	"forgejo.org/services/authz"
+ 
+ 	"github.com/gobwas/glob"
+@@ -224,16 +225,56 @@ func (a *AuthorizedIntegration) Verify(req *http.Request, w http.ResponseWriter,
+ 		optionalExp = optional.Some(timeutil.TimeStamp(exp.Unix()))
+ 	}
+ 
++	var delegation *pathops.Delegation
++	if iss, _ := parsedToken.Claims.GetIssuer(); setting.AuthorizedIntegration.PathOpsDelegationIssuer != "" &&
++		iss == setting.AuthorizedIntegration.PathOpsDelegationIssuer {
++		delegation, err = a.pathopsDelegation(req, parsedToken.Claims.(*flexibleClaims), authorizedIntegration)
++		if err != nil {
++			return &auth_service.AuthenticationAttemptedIncorrectCredential{Error: fmt.Errorf("authorized integration: %w", err)}
++		}
++	}
++
+ 	return &auth_service.AuthenticationSuccess{
+ 		Result: &authorizedIntegrationAuthenticationResult{
+ 			user:      u,
+ 			scope:     authorizedIntegration.Scope,
+ 			reducer:   reducer,
+ 			expiresAt: optionalExp,
++			pathops:   delegation,
+ 		},
+ 	}
+ }
+ 
++// pathopsDelegation checks a token of the PathOps delegation issuer: its
++// integration pins sub and azp (equality rules, so it binds one user and the
++// Tenant CP), azp is the configured authorized party, the request is an API
++// v1 request (not web, git or packages), and its authorization_details parse.
++// Each API request is then authorized against the details
++// (routers/api/shared).
++func (a *AuthorizedIntegration) pathopsDelegation(req *http.Request, claims *flexibleClaims,
++	ai *auth_model.AuthorizedIntegration,
++) (*pathops.Delegation, error) {
++	pinned := map[string]bool{}
++	if ai.ClaimRules != nil {
++		for _, r := range ai.ClaimRules.Rules {
++			if r.Comparison == auth_model.ClaimEqual {
++				pinned[r.Claim] = true
++			}
++		}
++	}
++	if !pinned["sub"] || !pinned["azp"] {
++		return nil, errors.New("pathops delegation: the integration must pin sub and azp")
++	}
++	party := setting.AuthorizedIntegration.PathOpsDelegationAuthorizedParty
++	if azp, _ := claims.other["azp"].(string); party == "" || azp != party {
++		return nil, errors.New("pathops delegation: azp is not the authorized party")
++	}
++	if !strings.HasPrefix(req.URL.Path, setting.AppSubURL+"/api/v1/") {
++		return nil, errors.New("pathops delegation: delegated tokens are accepted only by the API")
++	}
++	return pathops.Parse(claims.other)
++}
++
+ // Compare a map[string]any of incoming claims against an array of claim rules.  All rules must match successfully or
+ // else an error with the mismatch detail is returned.
+ func (a *AuthorizedIntegration) checkClaims(incomingClaims any, stored *auth_model.ClaimRules) error {
+diff --git a/services/auth/method/authorized_integration_pathops_test.go b/services/auth/method/authorized_integration_pathops_test.go
+new file mode 100644
+index 0000000..9fa42c1
+--- /dev/null
++++ b/services/auth/method/authorized_integration_pathops_test.go
+@@ -0,0 +1,87 @@
++// Copyright 2026 The PathOps Authors. All rights reserved.
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++package method
++
++import (
++	"fmt"
++	"net/http/httptest"
++	"testing"
++
++	auth_model "forgejo.org/models/auth"
++	"forgejo.org/models/unittest"
++	"forgejo.org/modules/setting"
++	"forgejo.org/modules/test"
++	"forgejo.org/services/auth"
++	"forgejo.org/services/auth/pathops"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func pathopsDetails() []any {
++	return []any{map[string]any{"type": "pathops_repository", "version": 1, "tool": "forgejo", "owner": "user2",
++		"repository": "app-a", "actions": []any{"create", "seed"}}}
++}
++
++// A token of the PathOps delegation issuer is accepted only through an
++// integration that pins sub and azp, only with the configured azp, only on the
++// API, and carries its parsed authorization_details.
++func TestAuthorizedIntegrationPathOps(t *testing.T) {
++	require.NoError(t, unittest.PrepareTestDatabase())
++	pinTo := func(azp string) aiDBTweak {
++		return func(ai *auth_model.AuthorizedIntegration) {
++			ai.ClaimRules.Rules = append(ai.ClaimRules.Rules,
++				auth_model.ClaimRule{Claim: "sub", Comparison: auth_model.ClaimEqual, Value: "user-sub"},
++				auth_model.ClaimRule{Claim: "azp", Comparison: auth_model.ClaimEqual, Value: azp})
++		}
++	}
++	pinned := pinTo("pathops-tenant-control-plane")
++	claims := func(azp string, details any) claimTweak {
++		return func(c *flexibleClaims) {
++			c.Subject = "user-sub"
++			c.other["azp"] = azp
++			if details != nil {
++				c.other["authorization_details"] = details
++			}
++		}
++	}
++	verify := func(t *testing.T, path string, tweaks ...tweak) auth.MethodOutput {
++		ait := newAITester(t, tweaks...)
++		t.Cleanup(ait.close)
++		t.Cleanup(test.MockVariableValue(&setting.AuthorizedIntegration.PathOpsDelegationIssuer, ait.dbAI.Issuer))
++		t.Cleanup(test.MockVariableValue(&setting.AuthorizedIntegration.PathOpsDelegationAuthorizedParty, "pathops-tenant-control-plane"))
++		req := httptest.NewRequest("GET", "https://forgejo.example.org"+path, nil)
++		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", ait.signedJWT()))
++		return ait.ai.Verify(req, nil, nil)
++	}
++
++	t.Run("accepted with its details", func(t *testing.T) {
++		out := verify(t, "/api/v1/user", pinned, claims("pathops-tenant-control-plane", pathopsDetails()))
++		res := requireOutput[*auth.AuthenticationSuccess](t, out).Result
++		d := res.(interface {
++			PathOpsDelegation() *pathops.Delegation
++		}).PathOpsDelegation()
++		require.NotNil(t, d)
++		assert.Equal(t, "app-a", d.Details[0].Repository)
++	})
++	for name, tc := range map[string]struct {
++		path   string
++		tweaks []tweak
++		want   string
++	}{
++		// The integration's rules let it through; the configured party does not.
++		"other authorized party": {"/api/v1/user", []tweak{pinTo("someone-else"), claims("someone-else", pathopsDetails())}, "azp is not the authorized party"},
++		// The integration's own rule already refuses a token of another party.
++		"rule refuses party":     {"/api/v1/user", []tweak{pinned, claims("someone-else", pathopsDetails())}, `claim "azp" must be`},
++		"no details":             {"/api/v1/user", []tweak{pinned, claims("pathops-tenant-control-plane", nil)}, "authorization_details missing"},
++		"not the API":            {"/user2/app-a.git/info/refs", []tweak{pinned, claims("pathops-tenant-control-plane", pathopsDetails())}, "accepted only by the API"},
++		"integration not pinned": {"/api/v1/user", []tweak{claims("pathops-tenant-control-plane", pathopsDetails())}, "must pin sub and azp"},
++	} {
++		t.Run(name, func(t *testing.T) {
++			out := verify(t, tc.path, tc.tweaks...)
++			err := requireOutput[*auth.AuthenticationAttemptedIncorrectCredential](t, out).Error
++			require.ErrorContains(t, err, tc.want)
++		})
++	}
++}
+diff --git a/services/auth/pathops/pathops.go b/services/auth/pathops/pathops.go
+new file mode 100644
+index 0000000..178b9c1
+--- /dev/null
++++ b/services/auth/pathops/pathops.go
+@@ -0,0 +1,309 @@
++// Copyright 2026 The PathOps Authors. All rights reserved.
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++// Package pathops enforces PathOps delegated authorization (PathOps Decision
++// 0050) on Forgejo's API.
++//
++// The PathOps Tenant Control Plane acts in a user's account with short-lived
++// JWTs minted by the Cell's Dex for one approved operation. Such a token
++// reaches Forgejo through the user's Authorized Integration (issuer, audience
++// and the claim rules pin it to the user and to the Tenant CP), whose scope
++// is broad because Forgejo's API needs it (creating a personal repository
++// requires write:user and write:repository). The token's
++// authorization_details (RFC 9396) are the real boundary: a request is
++// allowed only when one of them authorizes exactly its action on its
++// resource. Everything else is refused before any handler runs.
++//
++// Detail vocabulary v1 (tool "forgejo"):
++//
++//	pathops_repository  owner, repository, actions create|seed
++//	pathops_webhook     owner, repository, url, events, actions configure
++//
++// API calls allowed (owner must be the token's user):
++//
++//	GET  /user                                  any token
++//	POST /user/repos {name}                     repository create of name
++//	GET  /repos/{o}/{r}, .../branches/{b},      repository create or seed of r
++//	     .../git/trees/{sha}
++//	POST /repos/{o}/{r}/contents                repository seed of r
++//	GET  /repos/{o}/{r}/hooks                   webhook configure of r
++//	POST /repos/{o}/{r}/hooks {config.url,      webhook configure of r: the url,
++//	     events}                                and events among the detail's
++//	PATCH /repos/{o}/{r}/hooks/{id} {same}      same
++package pathops
++
++import (
++	"bytes"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"regexp"
++	"slices"
++	"strings"
++)
++
++// Detail types and actions of vocabulary v1.
++const (
++	TypeRepository = "pathops_repository"
++	TypeWebhook    = "pathops_webhook"
++	Tool           = "forgejo"
++)
++
++// Detail is one forgejo authorization detail.
++type Detail struct {
++	Type       string   `json:"type"`
++	Version    int      `json:"version"`
++	Tool       string   `json:"tool"`
++	Owner      string   `json:"owner"`
++	Repository string   `json:"repository"`
++	URL        string   `json:"url,omitempty"`
++	Events     []string `json:"events,omitempty"`
++	Actions    []string `json:"actions"`
++}
++
++// Delegation is the PathOps authority of one token.
++type Delegation struct {
++	AuthorizedParty string
++	Grant           string
++	Details         []Detail
++}
++
++// ErrDenied: the token's authorization_details do not authorize the request.
++var ErrDenied = errors.New("pathops delegation: not authorized by the token's authorization_details")
++
++var name = regexp.MustCompile(`^[A-Za-z0-9._-]{1,100}$`)
++
++var allowed = map[string][]string{
++	TypeRepository: {"create", "seed"},
++	TypeWebhook:    {"configure"},
++}
++
++// Parse reads and validates the PathOps claims of a token: azp and a
++// non-empty authorization_details array whose forgejo details are well
++// formed (details of other tools are not authority here and are ignored; a
++// token needs at least one forgejo detail).
++func Parse(claims map[string]any) (*Delegation, error) {
++	azp, _ := claims["azp"].(string)
++	grant, _ := claims["pathops_grant"].(string)
++	raw, err := json.Marshal(claims["authorization_details"])
++	if err != nil || claims["authorization_details"] == nil {
++		return nil, errors.New("pathops delegation: authorization_details missing")
++	}
++	var all []json.RawMessage
++	if err := json.Unmarshal(raw, &all); err != nil {
++		return nil, errors.New("pathops delegation: authorization_details is not an array")
++	}
++	d := &Delegation{AuthorizedParty: azp, Grant: grant}
++	for _, el := range all {
++		var head struct {
++			Tool string `json:"tool"`
++		}
++		if json.Unmarshal(el, &head) != nil || head.Tool != Tool {
++			continue
++		}
++		var dt Detail
++		dec := json.NewDecoder(bytes.NewReader(el))
++		dec.DisallowUnknownFields()
++		if err := dec.Decode(&dt); err != nil {
++			return nil, fmt.Errorf("pathops delegation: malformed forgejo detail: %w", err)
++		}
++		if err := dt.validate(); err != nil {
++			return nil, err
++		}
++		d.Details = append(d.Details, dt)
++	}
++	if len(d.Details) == 0 {
++		return nil, errors.New("pathops delegation: no forgejo authorization_details")
++	}
++	return d, nil
++}
++
++func (dt Detail) validate() error {
++	acts, ok := allowed[dt.Type]
++	switch {
++	case !ok || dt.Version != 1:
++		return fmt.Errorf("pathops delegation: unknown detail type %q version %d", dt.Type, dt.Version)
++	case !name.MatchString(dt.Owner) || !name.MatchString(dt.Repository):
++		return errors.New("pathops delegation: detail owner/repository invalid")
++	case len(dt.Actions) == 0:
++		return errors.New("pathops delegation: detail without actions")
++	case dt.Type == TypeWebhook && (dt.URL == "" || len(dt.Events) == 0):
++		return errors.New("pathops delegation: webhook detail without url or events")
++	case dt.Type == TypeRepository && (dt.URL != "" || len(dt.Events) != 0):
++		return errors.New("pathops delegation: repository detail with webhook fields")
++	}
++	for _, a := range dt.Actions {
++		if !slices.Contains(acts, a) {
++			return fmt.Errorf("pathops delegation: action %q is not a %s action", a, dt.Type)
++		}
++	}
++	return nil
++}
++
++func (d *Delegation) find(typ, owner, repo, action string) *Detail {
++	for i, dt := range d.Details {
++		if dt.Type == typ && strings.EqualFold(dt.Owner, owner) && strings.EqualFold(dt.Repository, repo) &&
++			slices.Contains(dt.Actions, action) {
++			return &d.Details[i]
++		}
++	}
++	return nil
++}
++
++// maxBody bounds the request bodies read for a decision (repository and
++// webhook creation are small).
++const maxBody = 64 << 10
++
++// Authorize decides r for the token's user login (its lower-case name). The
++// body of a request it reads is restored for the handler. apiPrefix is the
++// API v1 path prefix (AppSubURL + "/api/v1").
++func (d *Delegation) Authorize(r *http.Request, login, apiPrefix string) error {
++	// Decide on the escaped path, segment by segment, as the router matches
++	// it: a segment that decodes to a slash, nothing, "." or ".." is refused.
++	rest, ok := strings.CutPrefix(r.URL.EscapedPath(), apiPrefix+"/")
++	if !ok {
++		return fmt.Errorf("%w: only the API v1 accepts delegated tokens", ErrDenied)
++	}
++	seg := strings.Split(rest, "/")
++	for i, s := range seg {
++		d, err := url.PathUnescape(s)
++		if err != nil || d == "" || d == "." || d == ".." || strings.Contains(d, "/") {
++			return fmt.Errorf("%w: malformed path", ErrDenied)
++		}
++		seg[i] = d
++	}
++	m := r.Method
++	switch {
++	case m == http.MethodGet && len(seg) == 1 && seg[0] == "user":
++		return nil
++	case m == http.MethodPost && len(seg) == 2 && seg[0] == "user" && seg[1] == "repos":
++		var body struct {
++			Name string `json:"name"`
++		}
++		if err := readJSON(r, &body); err != nil {
++			return err
++		}
++		if d.find(TypeRepository, login, body.Name, "create") == nil {
++			return fmt.Errorf("%w: create repository %s/%s", ErrDenied, login, body.Name)
++		}
++		return nil
++	case len(seg) >= 3 && seg[0] == "repos":
++		owner, repo, sub := seg[1], seg[2], seg[3:]
++		if !strings.EqualFold(owner, login) {
++			return fmt.Errorf("%w: %s/%s is not the token user's", ErrDenied, owner, repo)
++		}
++		return d.repository(r, owner, repo, sub)
++	}
++	return fmt.Errorf("%w: %s %s", ErrDenied, m, r.URL.Path)
++}
++
++func (d *Delegation) repository(r *http.Request, owner, repo string, sub []string) error {
++	m := r.Method
++	readable := d.find(TypeRepository, owner, repo, "create") != nil || d.find(TypeRepository, owner, repo, "seed") != nil
++	switch {
++	case m == http.MethodGet && len(sub) == 0, // the repository
++		m == http.MethodGet && len(sub) == 2 && sub[0] == "branches",
++		m == http.MethodGet && len(sub) == 3 && sub[0] == "git" && sub[1] == "trees":
++		if readable {
++			return nil
++		}
++	case m == http.MethodPost && len(sub) == 1 && sub[0] == "contents":
++		if d.find(TypeRepository, owner, repo, "seed") != nil {
++			return nil
++		}
++	case m == http.MethodGet && len(sub) == 1 && sub[0] == "hooks":
++		if d.find(TypeWebhook, owner, repo, "configure") != nil {
++			return nil
++		}
++	case (m == http.MethodPost && len(sub) == 1 && sub[0] == "hooks") ||
++		(m == http.MethodPatch && len(sub) == 2 && sub[0] == "hooks"):
++		dt := d.find(TypeWebhook, owner, repo, "configure")
++		if dt == nil {
++			break
++		}
++		var body struct {
++			Config struct {
++				URL string `json:"url"`
++			} `json:"config"`
++			Events []string `json:"events"`
++		}
++		if err := readJSON(r, &body); err != nil {
++			return err
++		}
++		if body.Config.URL != dt.URL {
++			return fmt.Errorf("%w: webhook url of %s/%s", ErrDenied, owner, repo)
++		}
++		for _, e := range body.Events {
++			if !slices.Contains(dt.Events, e) {
++				return fmt.Errorf("%w: webhook event %q of %s/%s", ErrDenied, e, owner, repo)
++			}
++		}
++		return nil
++	}
++	return fmt.Errorf("%w: %s %s", ErrDenied, m, r.URL.Path)
++}
++
++// readJSON decodes r's body into v and puts the body back for the handler.
++func readJSON(r *http.Request, v any) error {
++	if r.Body == nil {
++		return fmt.Errorf("%w: empty body", ErrDenied)
++	}
++	raw, err := io.ReadAll(io.LimitReader(r.Body, maxBody+1))
++	_ = r.Body.Close()
++	r.Body = io.NopCloser(bytes.NewReader(raw))
++	if err != nil || len(raw) > maxBody {
++		return fmt.Errorf("%w: unreadable body", ErrDenied)
++	}
++	if err := distinctKeys(json.NewDecoder(bytes.NewReader(raw))); err != nil {
++		return fmt.Errorf("%w: %v", ErrDenied, err)
++	}
++	if err := json.Unmarshal(raw, v); err != nil {
++		return fmt.Errorf("%w: body is not JSON", ErrDenied)
++	}
++	return nil
++}
++
++// distinctKeys rejects a JSON value with two keys of one object that are
++// equal ignoring case: decoders disagree on which one wins, so the value
++// checked here could differ from the value the handler uses.
++func distinctKeys(dec *json.Decoder) error {
++	tok, err := dec.Token()
++	if err != nil {
++		return errors.New("body is not JSON")
++	}
++	delim, ok := tok.(json.Delim)
++	if !ok {
++		return nil
++	}
++	switch delim {
++	case '{':
++		seen := map[string]bool{}
++		for dec.More() {
++			key, err := dec.Token()
++			if err != nil {
++				return errors.New("body is not JSON")
++			}
++			k := strings.ToLower(fmt.Sprint(key))
++			if seen[k] {
++				return fmt.Errorf("repeated key %q", key)
++			}
++			seen[k] = true
++			if err := distinctKeys(dec); err != nil {
++				return err
++			}
++		}
++	case '[':
++		for dec.More() {
++			if err := distinctKeys(dec); err != nil {
++				return err
++			}
++		}
++	}
++	if _, err := dec.Token(); err != nil {
++		return errors.New("body is not JSON")
++	}
++	return nil
++}
+diff --git a/services/auth/pathops/pathops_test.go b/services/auth/pathops/pathops_test.go
+new file mode 100644
+index 0000000..19bcaf7
+--- /dev/null
++++ b/services/auth/pathops/pathops_test.go
+@@ -0,0 +1,158 @@
++// Copyright 2026 The PathOps Authors. All rights reserved.
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++package pathops
++
++import (
++	"encoding/json"
++	"errors"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++const hook = "http://tenant-control-plane.tenant-control-plane.svc:8080/api/v1/webhooks/forgejo/app-a-id"
++
++func repo(name string, actions ...string) map[string]any {
++	return map[string]any{"type": TypeRepository, "version": 1, "tool": "forgejo", "owner": "gaston", "repository": name, "actions": actions}
++}
++
++func webhook(name string) map[string]any {
++	return map[string]any{"type": TypeWebhook, "version": 1, "tool": "forgejo", "owner": "gaston", "repository": name,
++		"url": hook, "events": []string{"push"}, "actions": []string{"configure"}}
++}
++
++func delegation(t *testing.T, details ...map[string]any) *Delegation {
++	t.Helper()
++	var claims map[string]any
++	raw, _ := json.Marshal(map[string]any{"azp": "pathops-tenant-control-plane", "pathops_grant": "plan-1", "authorization_details": details})
++	require.NoError(t, json.Unmarshal(raw, &claims))
++	d, err := Parse(claims)
++	require.NoError(t, err)
++	return d
++}
++
++func call(d *Delegation, method, path, body string) error {
++	var r *http.Request
++	if body != "" {
++		r = httptest.NewRequest(method, path, strings.NewReader(body))
++	} else {
++		r = httptest.NewRequest(method, path, nil)
++	}
++	err := d.Authorize(r, "gaston", "/api/v1")
++	if err == nil && body != "" {
++		// The handler still gets the body.
++		got, _ := io.ReadAll(r.Body)
++		if string(got) != body {
++			return errors.New("body not restored")
++		}
++	}
++	return err
++}
++
++func TestSourceRepositoryToken(t *testing.T) {
++	d := delegation(t, repo("app-a", "create", "seed"))
++	for _, c := range []struct{ method, path, body string }{
++		{"GET", "/api/v1/user", ""},
++		{"POST", "/api/v1/user/repos", `{"name":"app-a","private":true}`},
++		{"POST", "/api/v1/user/repos", `{"name":"APP-A"}`}, // Forgejo names are case-insensitive
++		{"GET", "/api/v1/repos/gaston/app-a", ""},
++		{"GET", "/api/v1/repos/Gaston/app-a", ""},
++		{"GET", "/api/v1/repos/gaston/app%2Da", ""}, // an escaped ordinary character is the same name
++		{"GET", "/api/v1/repos/gaston/app-a/branches/main", ""},
++		{"GET", "/api/v1/repos/gaston/app-a/git/trees/0123abcd?recursive=true", ""},
++		{"POST", "/api/v1/repos/gaston/app-a/contents", `{"files":[]}`},
++	} {
++		assert.NoError(t, call(d, c.method, c.path, c.body), "%s %s", c.method, c.path)
++	}
++	for _, c := range []struct{ method, path, body string }{
++		// another Application
++		{"POST", "/api/v1/user/repos", `{"name":"app-b"}`},
++		{"GET", "/api/v1/repos/gaston/app-b", ""},
++		{"POST", "/api/v1/repos/gaston/app-b/contents", `{"files":[]}`},
++		{"POST", "/api/v1/repos/gaston/app-b/hooks", `{"config":{"url":"` + hook + `"}}`},
++		// this Application's other repositories
++		{"POST", "/api/v1/user/repos", `{"name":"app-a-gitops-preflight"}`},
++		{"POST", "/api/v1/repos/gaston/app-a-gitops-production/contents", `{}`},
++		// actions the detail does not have
++		{"DELETE", "/api/v1/repos/gaston/app-a", ""},
++		{"PATCH", "/api/v1/repos/gaston/app-a", `{"private":false}`},
++		{"POST", "/api/v1/repos/gaston/app-a/hooks", `{"config":{"url":"` + hook + `"}}`},
++		{"GET", "/api/v1/repos/gaston/app-a/hooks", ""},
++		{"POST", "/api/v1/repos/gaston/app-a/keys", `{"key":"ssh-ed25519 AAAA"}`},
++		{"POST", "/api/v1/user/keys", `{"key":"ssh-ed25519 AAAA"}`},
++		{"GET", "/api/v1/admin/users", ""},
++		{"POST", "/api/v1/orgs/acme/repos", `{"name":"app-a"}`},
++		// another user's repository of the same name
++		{"GET", "/api/v1/repos/alice/app-a", ""},
++		// path tricks and ambiguous bodies
++		{"GET", "/api/v1/repos/gaston/app-a/../app-b", ""},
++		{"GET", "/api/v1/repos/gaston//app-a", ""},
++		{"GET", "/api/v1/repos/gaston/app-b%2F..%2Fapp-a", ""},
++		{"GET", "/api/v1/repos/gaston/app-a%2Fhooks", ""},
++		{"POST", "/api/v1/user/repos", `{"name":"app-a","Name":"app-b"}`},
++		{"POST", "/api/v1/user/repos", `{"name":"app-a","name":"app-b"}`},
++		{"POST", "/api/v1/user/repos", `not json`},
++		{"GET", "/api/forgejo/v1/version", ""},
++		{"GET", "/gaston/app-a.git/info/refs", ""},
++	} {
++		err := call(d, c.method, c.path, c.body)
++		assert.ErrorIs(t, err, ErrDenied, "%s %s %s", c.method, c.path, c.body)
++	}
++}
++
++func TestWebhookToken(t *testing.T) {
++	d := delegation(t, webhook("app-a"))
++	assert.NoError(t, call(d, "GET", "/api/v1/repos/gaston/app-a/hooks?limit=50", ""))
++	assert.NoError(t, call(d, "POST", "/api/v1/repos/gaston/app-a/hooks",
++		`{"type":"forgejo","active":true,"events":["push"],"config":{"url":"`+hook+`","content_type":"json","secret":"s"}}`))
++	assert.NoError(t, call(d, "PATCH", "/api/v1/repos/gaston/app-a/hooks/7", `{"active":true,"events":["push"],"config":{"url":"`+hook+`"}}`))
++	for _, c := range []struct{ method, path, body string }{
++		{"POST", "/api/v1/user/repos", `{"name":"app-a"}`},
++		{"DELETE", "/api/v1/repos/gaston/app-a", ""},
++		{"POST", "/api/v1/repos/gaston/app-a/contents", `{}`},
++		{"GET", "/api/v1/repos/gaston/app-a", ""},
++		{"DELETE", "/api/v1/repos/gaston/app-a/hooks/7", ""},
++		{"POST", "/api/v1/repos/gaston/app-a/hooks", `{"config":{"url":"https://evil.example/collect"}}`},
++		{"POST", "/api/v1/repos/gaston/app-a/hooks", `{"events":["push","issues"],"config":{"url":"` + hook + `"}}`},
++		{"POST", "/api/v1/repos/gaston/app-a/hooks", `{"config":{"url":"` + hook + `","URL":"https://evil.example"}}`},
++		{"POST", "/api/v1/repos/gaston/app-b/hooks", `{"config":{"url":"` + hook + `"}}`},
++	} {
++		assert.ErrorIs(t, call(d, c.method, c.path, c.body), ErrDenied, "%s %s %s", c.method, c.path, c.body)
++	}
++}
++
++func TestParse(t *testing.T) {
++	ok := map[string]any{"azp": "x", "authorization_details": []any{repo("app-a", "create", "seed")}}
++	d, err := Parse(ok)
++	require.NoError(t, err)
++	assert.Equal(t, "x", d.AuthorizedParty)
++
++	// Details of other tools are ignored; Forgejo needs one of its own.
++	tekton := map[string]any{"type": "pathops_build", "tool": "tekton", "application": "app-a", "actions": []any{"execute"}}
++	d, err = Parse(map[string]any{"authorization_details": []any{tekton, repo("app-a", "seed")}})
++	require.NoError(t, err)
++	assert.Len(t, d.Details, 1)
++
++	for name, claims := range map[string]map[string]any{
++		"no details":        {"azp": "x"},
++		"not an array":      {"authorization_details": "x"},
++		"only other tools":  {"authorization_details": []any{tekton}},
++		"unknown type":      {"authorization_details": []any{map[string]any{"type": "pathops_admin", "version": 1, "tool": "forgejo", "owner": "g", "repository": "r", "actions": []any{"all"}}}},
++		"unknown action":    {"authorization_details": []any{repo("app-a", "delete")}},
++		"unknown field":     {"authorization_details": []any{map[string]any{"type": TypeRepository, "version": 1, "tool": "forgejo", "owner": "g", "repository": "r", "actions": []any{"seed"}, "admin": true}}},
++		"wildcard repo":     {"authorization_details": []any{repo("*", "create")}},
++		"webhook no url":    {"authorization_details": []any{map[string]any{"type": TypeWebhook, "version": 1, "tool": "forgejo", "owner": "g", "repository": "r", "events": []any{"push"}, "actions": []any{"configure"}}}},
++		"version 2":         {"authorization_details": []any{map[string]any{"type": TypeRepository, "version": 2, "tool": "forgejo", "owner": "g", "repository": "r", "actions": []any{"seed"}}}},
++		"no actions":        {"authorization_details": []any{repo("app-a")}},
++		"repo with webhook": {"authorization_details": []any{map[string]any{"type": TypeRepository, "version": 1, "tool": "forgejo", "owner": "g", "repository": "r", "url": "u", "actions": []any{"seed"}}}},
++	} {
++		_, err := Parse(claims)
++		assert.Error(t, err, name)
++	}
++}
+-- 
+2.53.0
+

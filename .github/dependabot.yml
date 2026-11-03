@@ -1,0 +1,8 @@
+# Only GitHub Actions are updated automatically. UPSTREAM_VERSION/UPSTREAM_COMMIT
+# are changed deliberately, because every Forgejo upgrade must re-verify the patches.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

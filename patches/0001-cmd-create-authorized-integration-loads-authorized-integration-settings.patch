@@ -1,0 +1,148 @@
+From 8f066d9187b26080f74be7b62b1002958e6045f4 Mon Sep 17 00:00:00 2001
+From: PathOps <noreply@pathops.dev>
+Date: Tue, 3 Nov 2026 09:26:18 -0300
+Subject: [PATCH 1/2] cmd: create-authorized-integration honors
+ [authorized_integration]
+
+The operator command `forgejo admin user create-authorized-integration`
+initializes only the database settings, so its issuer validation ignored
+[authorized_integration] ALLOWED_DOMAINS/BLOCKED_DOMAINS and refused an
+issuer that resolves to a private address even when the server allows it.
+Load that section before validating, as the server does.
+
+Add --reuse-existing so onboarding can run it idempotently: when the user
+already has an integration with this name and the same issuer, scope,
+all-repositories resource and claim rules, print it (with its audience)
+instead of failing; a different one with the same name stays an error.
+---
+ ...in_user_generate_authorized_integration.go | 59 ++++++++++++++++++-
+ modules/setting/authorized_integration.go     |  7 +++
+ 2 files changed, 64 insertions(+), 2 deletions(-)
+
+diff --git a/cmd/admin_user_generate_authorized_integration.go b/cmd/admin_user_generate_authorized_integration.go
+index 7c01bc8..5bcf080 100644
+--- a/cmd/admin_user_generate_authorized_integration.go
++++ b/cmd/admin_user_generate_authorized_integration.go
+@@ -9,12 +9,15 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"os"
++	"slices"
+ 	"strings"
+ 
+ 	auth_model "forgejo.org/models/auth"
++	"forgejo.org/models/db"
+ 	"forgejo.org/models/repo"
+ 	user_model "forgejo.org/models/user"
+ 	"forgejo.org/modules/json"
++	"forgejo.org/modules/setting"
+ 	auth_service "forgejo.org/services/auth"
+ 
+ 	"github.com/urfave/cli/v3"
+@@ -92,6 +95,10 @@ enable-openid-connect flag in a workflow.`,
+ 				Value: []string{"all"},
+ 				Usage: `Zero-or-more specific repositories that can be accessed, or "all" to allow access to all repositories, example: "owner1/repo1"`,
+ 			},
++			&cli.BoolFlag{
++				Name:  "reuse-existing",
++				Usage: "If the user has an authorized integration with this name, the same issuer, scope, repositories and claim rules, print it instead of failing; a different one with this name is an error",
++			},
+ 		},
+ 		Before: noDanglingArgs,
+ 		Action: runCreateAuthorizedIntegration,
+@@ -109,6 +116,9 @@ func runCreateAuthorizedIntegration(ctx context.Context, c *cli.Command) error {
+ 	if err := initDB(ctx); err != nil {
+ 		return err
+ 	}
++	// The issuer is validated like the server does, with its
++	// [authorized_integration] ALLOWED_DOMAINS/BLOCKED_DOMAINS.
++	setting.LoadAuthorizedIntegrationSetting()
+ 
+ 	user, err := user_model.GetUserByName(ctx, c.String("username"))
+ 	if err != nil {
+@@ -195,8 +205,22 @@ func runCreateAuthorizedIntegration(ctx context.Context, c *cli.Command) error {
+ 		rr[i] = &auth_model.AuthorizedIntegResourceRepo{RepoID: repos[i].ID}
+ 	}
+ 
+-	if err := auth_service.InsertAuthorizedIntegration(ctx, ai, rr); err != nil {
++	message := "Authorized integration was successfully created."
++	existing, err := existingAuthorizedIntegration(ctx, user.ID, strings.TrimSpace(ai.Name))
++	switch {
++	case err != nil:
+ 		return err
++	case existing != nil && !c.Bool("reuse-existing"):
++		return fmt.Errorf("the user already has an authorized integration named %q", ai.Name)
++	case existing != nil:
++		if !sameAuthorizedIntegration(existing, ai) || !existing.ResourceAllRepos || len(rr) != 0 {
++			return fmt.Errorf("the user's authorized integration %q differs from the requested one; delete it first", ai.Name)
++		}
++		ai, message = existing, "Authorized integration already exists."
++	default:
++		if err := auth_service.InsertAuthorizedIntegration(ctx, ai, rr); err != nil {
++			return err
++		}
+ 	}
+ 
+ 	type ClaimRuleDescription struct {
+@@ -214,7 +238,7 @@ func runCreateAuthorizedIntegration(ctx context.Context, c *cli.Command) error {
+ 		Audience    string                 `json:"audience"`
+ 		ClaimRules  []ClaimRuleDescription `json:"claim_rules"`
+ 	}{
+-		Message:     "Authorized integration was successfully created.",
++		Message:     message,
+ 		Name:        ai.Name,
+ 		Description: ai.Description,
+ 		Issuer:      ai.Issuer,
+@@ -253,3 +277,34 @@ func runCreateAuthorizedIntegration(ctx context.Context, c *cli.Command) error {
+ 
+ 	return nil
+ }
++
++// existingAuthorizedIntegration returns the user's authorized integration
++// named name, or nil.
++func existingAuthorizedIntegration(ctx context.Context, userID int64, name string) (*auth_model.AuthorizedIntegration, error) {
++	ai := &auth_model.AuthorizedIntegration{}
++	has, err := db.GetEngine(ctx).Where("user_id = ? AND name = ?", userID, name).Get(ai)
++	if err != nil || !has {
++		return nil, err
++	}
++	return ai, nil
++}
++
++// sameAuthorizedIntegration compares what an authorized integration
++// authorizes: issuer, scope and claim rules (in any order).
++func sameAuthorizedIntegration(a, b *auth_model.AuthorizedIntegration) bool {
++	if a.Issuer != b.Issuer || a.Scope != b.Scope || a.ResourceAllRepos != b.ResourceAllRepos {
++		return false
++	}
++	key := func(rules *auth_model.ClaimRules) []string {
++		var out []string
++		if rules != nil {
++			for _, r := range rules.Rules {
++				raw, _ := json.Marshal(r)
++				out = append(out, string(raw))
++			}
++		}
++		slices.Sort(out)
++		return out
++	}
++	return slices.Equal(key(a.ClaimRules), key(b.ClaimRules))
++}
+diff --git a/modules/setting/authorized_integration.go b/modules/setting/authorized_integration.go
+index 0a84f44..8bee9b4 100644
+--- a/modules/setting/authorized_integration.go
++++ b/modules/setting/authorized_integration.go
+@@ -21,3 +21,10 @@ func loadAuthorizedIntegrationFrom(rootCfg ConfigProvider) {
+ 	AuthorizedIntegration.RequestTimeout = sec.Key("REQUEST_TIMEOUT").MustDuration(10 * time.Second)
+ 	AuthorizedIntegration.CacheTTL = sec.Key("CACHE_TTL").MustDuration(10 * time.Minute)
+ }
++
++// LoadAuthorizedIntegrationSetting loads the [authorized_integration] section
++// for commands that do not load the full settings (the operator CLI), so they
++// validate issuers with the same ALLOWED_DOMAINS/BLOCKED_DOMAINS as the server.
++func LoadAuthorizedIntegrationSetting() {
++	loadAuthorizedIntegrationFrom(CfgProvider)
++}
+-- 
+2.53.0
+

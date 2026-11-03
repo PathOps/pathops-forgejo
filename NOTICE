@@ -1,0 +1,15 @@
+PathOps Forgejo
+
+This repository contains build tooling and a patch set for Forgejo
+(https://codeberg.org/forgejo/forgejo), which is licensed under the GNU General
+Public License, version 3 or later. Forgejo source code is not vendored here;
+it is fetched from the upstream release pinned in UPSTREAM_VERSION and
+UPSTREAM_COMMIT.
+
+The files under patches/ modify Forgejo. Each patch states the upstream files
+it changes and why. Images built from this repository contain the modified
+Forgejo built with the upstream rootless Dockerfile; their complete
+corresponding source is the pinned upstream release plus these patches.
+
+The build scripts, workflows and patches in this repository are licensed under
+the GNU General Public License, version 3 or later (see LICENSE).
