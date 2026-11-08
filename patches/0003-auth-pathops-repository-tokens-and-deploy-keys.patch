@@ -1,0 +1,479 @@
+From 932e266beef6424c9f1962a0f112cd7495ab15c9 Mon Sep 17 00:00:00 2001
+From: PathOps <noreply@pathops.dev>
+Date: Sat, 7 Nov 2026 23:41:28 -0300
+Subject: [PATCH] auth: PathOps repository tokens and deploy keys for
+ BUILD_AND_PUSH
+
+PathOps Decision 0056 provisions an Application's BUILD_AND_PUSH access
+as the user, with delegated tokens, in two read-only credentials of the
+source repository:
+
+- pathops_repository_token (owner, repository, name, scopes
+  ["read:repository"], actions create|revoke): list the user's access
+  tokens, create exactly that named token readable only for that one
+  repository (the Tekton resolver's), and delete it by that exact name
+  (an orphan left when the creation's answer was lost). The name can
+  never be taken for a token id.
+- pathops_deploy_key (owner, repository, title, read_only true, actions
+  configure): list the repository's deploy keys and add one with that
+  title, read_only present and true (it defaults to false).
+- pathops_repository gains the read action: the repository and its git
+  trees, without the create/seed write authority.
+
+Access token creation and deletion are basic-auth-only routes;
+ReqBasicOrRevProxyAuth lets a PathOps delegated token through them,
+since its authorization_details authorized the exact request before
+routing. Every other token is still refused there.
+---
+ .../req_basic_or_rev_proxy_auth.go            |   9 ++
+ ...eq_basic_or_rev_proxy_auth_pathops_test.go |  59 ++++++++
+ services/auth/pathops/pathops.go              | 137 ++++++++++++++++--
+ services/auth/pathops/pathops_test.go         | 119 +++++++++++++++
+ 4 files changed, 312 insertions(+), 12 deletions(-)
+ create mode 100644 routers/api/v1/permissions/req_basic_or_rev_proxy_auth_pathops_test.go
+
+diff --git a/routers/api/v1/permissions/req_basic_or_rev_proxy_auth.go b/routers/api/v1/permissions/req_basic_or_rev_proxy_auth.go
+index 07785ea..6c79017 100644
+--- a/routers/api/v1/permissions/req_basic_or_rev_proxy_auth.go
++++ b/routers/api/v1/permissions/req_basic_or_rev_proxy_auth.go
+@@ -7,6 +7,7 @@ import (
+ 	"net/http"
+ 
+ 	"forgejo.org/modules/setting"
++	"forgejo.org/services/auth/pathops"
+ )
+ 
+ func ReqBasicOrRevProxyAuth(ctx Context) {
+@@ -14,6 +15,14 @@ func ReqBasicOrRevProxyAuth(ctx Context) {
+ 		return
+ 	}
+ 
++	// PathOps: a delegated token reaches a basic-auth-only route (access
++	// token creation and deletion) only when its authorization_details
++	// authorized exactly this request before routing (routers/api/shared).
++	if ar, ok := ctx.Authentication().(interface{ PathOpsDelegation() *pathops.Delegation }); ok && ctx.IsSigned() &&
++		ar.PathOpsDelegation() != nil {
++		return
++	}
++
+ 	// Require basic authorization method to be used and that basic
+ 	// authorization used password login to verify the user.
+ 	if !ctx.Authentication().IsPasswordAuthentication() {
+diff --git a/routers/api/v1/permissions/req_basic_or_rev_proxy_auth_pathops_test.go b/routers/api/v1/permissions/req_basic_or_rev_proxy_auth_pathops_test.go
+new file mode 100644
+index 0000000..fe63da2
+--- /dev/null
++++ b/routers/api/v1/permissions/req_basic_or_rev_proxy_auth_pathops_test.go
+@@ -0,0 +1,59 @@
++// Copyright 2026 The PathOps Authors. All rights reserved.
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++package permissions
++
++import (
++	"testing"
++
++	"forgejo.org/services/auth"
++	"forgejo.org/services/auth/pathops"
++
++	"github.com/stretchr/testify/assert"
++)
++
++type tokenResult struct {
++	auth.AuthenticationResult // only the methods below are called
++}
++
++func (*tokenResult) IsPasswordAuthentication() bool     { return false }
++func (*tokenResult) IsReverseProxyAuthentication() bool { return false }
++
++type pathopsResult struct {
++	tokenResult
++	d *pathops.Delegation
++}
++
++func (r *pathopsResult) PathOpsDelegation() *pathops.Delegation { return r.d }
++
++// permissionContext: embedded as Context, its field would hide the method.
++type permissionContext = Context
++
++type basicAuthContext struct {
++	permissionContext // only the methods below are called
++	signed            bool
++	result            auth.AuthenticationResult
++	status            int
++}
++
++func (c *basicAuthContext) IsSigned() bool                            { return c.signed }
++func (c *basicAuthContext) Authentication() auth.AuthenticationResult { return c.result }
++func (c *basicAuthContext) Error(status int, _ string, _ any)         { c.status = status }
++
++// A PathOps delegated token passes the basic-auth-only routes (its details
++// were checked against the exact request before routing); any other token
++// still does not.
++func TestReqBasicOrRevProxyAuthPathOps(t *testing.T) {
++	delegated := &basicAuthContext{signed: true, result: &pathopsResult{d: &pathops.Delegation{}}}
++	ReqBasicOrRevProxyAuth(delegated)
++	assert.Zero(t, delegated.status)
++
++	for name, c := range map[string]*basicAuthContext{
++		"not a delegated token":        {signed: true, result: &tokenResult{}},
++		"authorized integration token": {signed: true, result: &pathopsResult{}},
++		"not signed":                   {signed: false, result: &pathopsResult{d: &pathops.Delegation{}}},
++	} {
++		ReqBasicOrRevProxyAuth(c)
++		assert.Equal(t, 401, c.status, name)
++	}
++}
+diff --git a/services/auth/pathops/pathops.go b/services/auth/pathops/pathops.go
+index 178b9c1..9c4f75a 100644
+--- a/services/auth/pathops/pathops.go
++++ b/services/auth/pathops/pathops.go
+@@ -16,20 +16,37 @@
+ //
+ // Detail vocabulary v1 (tool "forgejo"):
+ //
+-//	pathops_repository  owner, repository, actions create|seed
+-//	pathops_webhook     owner, repository, url, events, actions configure
++//	pathops_repository        owner, repository, actions create|seed|read
++//	pathops_webhook           owner, repository, url, events, actions configure
++//	pathops_repository_token  owner, repository, name, scopes ["read:repository"],
++//	                          actions create|revoke
++//	pathops_deploy_key        owner, repository, title, read_only true,
++//	                          actions configure
+ //
+ // API calls allowed (owner must be the token's user):
+ //
+ //	GET  /user                                  any token
+ //	POST /user/repos {name}                     repository create of name
+-//	GET  /repos/{o}/{r}, .../branches/{b},      repository create or seed of r
++//	GET  /repos/{o}/{r}, .../branches/{b},      repository create, seed or read of r
+ //	     .../git/trees/{sha}
+ //	POST /repos/{o}/{r}/contents                repository seed of r
+ //	GET  /repos/{o}/{r}/hooks                   webhook configure of r
+ //	POST /repos/{o}/{r}/hooks {config.url,      webhook configure of r: the url,
+ //	     events}                                and events among the detail's
+ //	PATCH /repos/{o}/{r}/hooks/{id} {same}      same
++//	GET  /users/{o}/tokens                      repository token create or revoke
++//	POST /users/{o}/tokens {name, scopes,       repository token create: exactly its
++//	     repositories}                          name, scopes and repository o/r
++//	DELETE /users/{o}/tokens/{name}             repository token revoke of that name
++//	GET  /repos/{o}/{r}/keys                    deploy key configure of r
++//	POST /repos/{o}/{r}/keys {title, key,       deploy key configure of r: its title,
++//	     read_only}                             read_only literally true
++//
++// A repository token is a user access token readable only for one repository
++// (the Tekton resolver's); a deploy key is a read-only SSH key of one
++// repository (the build's checkout). Token creation and deletion otherwise
++// require basic authentication; a delegated token reaches them only for what
++// its details authorize (routers/api/v1/permissions).
+ package pathops
+ 
+ import (
+@@ -42,16 +59,22 @@ import (
+ 	"net/url"
+ 	"regexp"
+ 	"slices"
++	"strconv"
+ 	"strings"
+ )
+ 
+ // Detail types and actions of vocabulary v1.
+ const (
+-	TypeRepository = "pathops_repository"
+-	TypeWebhook    = "pathops_webhook"
+-	Tool           = "forgejo"
++	TypeRepository      = "pathops_repository"
++	TypeWebhook         = "pathops_webhook"
++	TypeRepositoryToken = "pathops_repository_token"
++	TypeDeployKey       = "pathops_deploy_key"
++	Tool                = "forgejo"
+ )
+ 
++// RepositoryTokenScope is the only scope of a repository token.
++const RepositoryTokenScope = "read:repository"
++
+ // Detail is one forgejo authorization detail.
+ type Detail struct {
+ 	Type       string   `json:"type"`
+@@ -61,7 +84,13 @@ type Detail struct {
+ 	Repository string   `json:"repository"`
+ 	URL        string   `json:"url,omitempty"`
+ 	Events     []string `json:"events,omitempty"`
+-	Actions    []string `json:"actions"`
++	// Name and Scopes of a repository token.
++	Name   string   `json:"name,omitempty"`
++	Scopes []string `json:"scopes,omitempty"`
++	// Title and ReadOnly of a deploy key.
++	Title    string   `json:"title,omitempty"`
++	ReadOnly *bool    `json:"read_only,omitempty"`
++	Actions  []string `json:"actions"`
+ }
+ 
+ // Delegation is the PathOps authority of one token.
+@@ -77,8 +106,10 @@ var ErrDenied = errors.New("pathops delegation: not authorized by the token's au
+ var name = regexp.MustCompile(`^[A-Za-z0-9._-]{1,100}$`)
+ 
+ var allowed = map[string][]string{
+-	TypeRepository: {"create", "seed"},
+-	TypeWebhook:    {"configure"},
++	TypeRepository:      {"create", "seed", "read"},
++	TypeWebhook:         {"configure"},
++	TypeRepositoryToken: {"create", "revoke"},
++	TypeDeployKey:       {"configure"},
+ }
+ 
+ // Parse reads and validates the PathOps claims of a token: azp and a
+@@ -130,10 +161,18 @@ func (dt Detail) validate() error {
+ 		return errors.New("pathops delegation: detail owner/repository invalid")
+ 	case len(dt.Actions) == 0:
+ 		return errors.New("pathops delegation: detail without actions")
++	case (dt.Type != TypeWebhook && (dt.URL != "" || len(dt.Events) != 0)) ||
++		(dt.Type != TypeRepositoryToken && (dt.Name != "" || len(dt.Scopes) != 0)) ||
++		(dt.Type != TypeDeployKey && (dt.Title != "" || dt.ReadOnly != nil)):
++		return fmt.Errorf("pathops delegation: %s detail with fields of another type", dt.Type)
+ 	case dt.Type == TypeWebhook && (dt.URL == "" || len(dt.Events) == 0):
+ 		return errors.New("pathops delegation: webhook detail without url or events")
+-	case dt.Type == TypeRepository && (dt.URL != "" || len(dt.Events) != 0):
+-		return errors.New("pathops delegation: repository detail with webhook fields")
++	case dt.Type == TypeRepositoryToken && !tokenName(dt.Name):
++		return errors.New("pathops delegation: repository token detail without a valid name")
++	case dt.Type == TypeRepositoryToken && !slices.Equal(dt.Scopes, []string{RepositoryTokenScope}):
++		return fmt.Errorf("pathops delegation: a repository token's scopes are exactly [%s]", RepositoryTokenScope)
++	case dt.Type == TypeDeployKey && (!name.MatchString(dt.Title) || dt.ReadOnly == nil || !*dt.ReadOnly):
++		return errors.New("pathops delegation: a deploy key detail needs a title and read_only true")
+ 	}
+ 	for _, a := range dt.Actions {
+ 		if !slices.Contains(acts, a) {
+@@ -143,6 +182,13 @@ func (dt Detail) validate() error {
+ 	return nil
+ }
+ 
++// tokenName: a valid access token name that Forgejo's delete-by-name cannot
++// take for a token id (it parses the path segment as an integer first).
++func tokenName(s string) bool {
++	_, err := strconv.ParseInt(s, 0, 64)
++	return name.MatchString(s) && err != nil
++}
++
+ func (d *Delegation) find(typ, owner, repo, action string) *Detail {
+ 	for i, dt := range d.Details {
+ 		if dt.Type == typ && strings.EqualFold(dt.Owner, owner) && strings.EqualFold(dt.Repository, repo) &&
+@@ -196,13 +242,59 @@ func (d *Delegation) Authorize(r *http.Request, login, apiPrefix string) error {
+ 			return fmt.Errorf("%w: %s/%s is not the token user's", ErrDenied, owner, repo)
+ 		}
+ 		return d.repository(r, owner, repo, sub)
++	case len(seg) >= 3 && seg[0] == "users" && seg[2] == "tokens":
++		if !strings.EqualFold(seg[1], login) {
++			return fmt.Errorf("%w: the tokens of %s are not the token user's", ErrDenied, seg[1])
++		}
++		return d.tokens(r, login, seg[3:])
++	}
++	return fmt.Errorf("%w: %s %s", ErrDenied, m, r.URL.Path)
++}
++
++// tokens decides on the token user's access tokens: list them, create exactly
++// a detail's repository token, or delete one by a detail's exact name.
++func (d *Delegation) tokens(r *http.Request, login string, sub []string) error {
++	m := r.Method
++	switch {
++	case m == http.MethodGet && len(sub) == 0:
++		for _, dt := range d.Details {
++			if dt.Type == TypeRepositoryToken {
++				return nil
++			}
++		}
++	case m == http.MethodPost && len(sub) == 0:
++		var body struct {
++			Name         string   `json:"name"`
++			Scopes       []string `json:"scopes"`
++			Repositories []struct {
++				Owner string `json:"owner"`
++				Name  string `json:"name"`
++			} `json:"repositories"`
++		}
++		if err := readJSON(r, &body); err != nil {
++			return err
++		}
++		if len(body.Repositories) == 1 {
++			dt := d.find(TypeRepositoryToken, body.Repositories[0].Owner, body.Repositories[0].Name, "create")
++			if dt != nil && strings.EqualFold(dt.Owner, login) && body.Name == dt.Name && slices.Equal(body.Scopes, dt.Scopes) {
++				return nil
++			}
++		}
++		return fmt.Errorf("%w: create access token %q", ErrDenied, body.Name)
++	case m == http.MethodDelete && len(sub) == 1:
++		for _, dt := range d.Details {
++			if dt.Type == TypeRepositoryToken && dt.Name == sub[0] && slices.Contains(dt.Actions, "revoke") {
++				return nil
++			}
++		}
+ 	}
+ 	return fmt.Errorf("%w: %s %s", ErrDenied, m, r.URL.Path)
+ }
+ 
+ func (d *Delegation) repository(r *http.Request, owner, repo string, sub []string) error {
+ 	m := r.Method
+-	readable := d.find(TypeRepository, owner, repo, "create") != nil || d.find(TypeRepository, owner, repo, "seed") != nil
++	readable := d.find(TypeRepository, owner, repo, "create") != nil || d.find(TypeRepository, owner, repo, "seed") != nil ||
++		d.find(TypeRepository, owner, repo, "read") != nil
+ 	switch {
+ 	case m == http.MethodGet && len(sub) == 0, // the repository
+ 		m == http.MethodGet && len(sub) == 2 && sub[0] == "branches",
+@@ -242,6 +334,27 @@ func (d *Delegation) repository(r *http.Request, owner, repo string, sub []strin
+ 			}
+ 		}
+ 		return nil
++	case m == http.MethodGet && len(sub) == 1 && sub[0] == "keys":
++		if d.find(TypeDeployKey, owner, repo, "configure") != nil {
++			return nil
++		}
++	case m == http.MethodPost && len(sub) == 1 && sub[0] == "keys":
++		dt := d.find(TypeDeployKey, owner, repo, "configure")
++		if dt == nil {
++			break
++		}
++		var body struct {
++			Title    string `json:"title"`
++			ReadOnly *bool  `json:"read_only"`
++		}
++		if err := readJSON(r, &body); err != nil {
++			return err
++		}
++		// read_only defaults to false: it must be present and true.
++		if body.Title != dt.Title || body.ReadOnly == nil || !*body.ReadOnly {
++			return fmt.Errorf("%w: deploy key %q of %s/%s must be read-only with the approved title", ErrDenied, body.Title, owner, repo)
++		}
++		return nil
+ 	}
+ 	return fmt.Errorf("%w: %s %s", ErrDenied, m, r.URL.Path)
+ }
+diff --git a/services/auth/pathops/pathops_test.go b/services/auth/pathops/pathops_test.go
+index 19bcaf7..8faf57a 100644
+--- a/services/auth/pathops/pathops_test.go
++++ b/services/auth/pathops/pathops_test.go
+@@ -156,3 +156,122 @@ func TestParse(t *testing.T) {
+ 		assert.Error(t, err, name)
+ 	}
+ }
++
++const resolution = "pathops-resolution-0b2f6c1e-7d5a-4c3e-9f10-2a3b4c5d6e7f"
++
++func repositoryToken(name string, actions ...string) map[string]any {
++	return map[string]any{"type": TypeRepositoryToken, "version": 1, "tool": "forgejo", "owner": "gaston", "repository": name,
++		"name": resolution, "scopes": []string{RepositoryTokenScope}, "actions": actions}
++}
++
++func deployKey(name string) map[string]any {
++	return map[string]any{"type": TypeDeployKey, "version": 1, "tool": "forgejo", "owner": "gaston", "repository": name,
++		"title": "pathops-build-app-a", "read_only": true, "actions": []string{"configure"}}
++}
++
++func TestRepositoryTokenDetail(t *testing.T) {
++	d := delegation(t, repositoryToken("app-a", "create", "revoke"))
++	create := `{"name":"` + resolution + `","scopes":["read:repository"],"repositories":[{"owner":"gaston","name":"app-a"}]}`
++	for _, c := range []struct{ method, path, body string }{
++		{"GET", "/api/v1/users/gaston/tokens", ""},
++		{"POST", "/api/v1/users/gaston/tokens", create},
++		{"POST", "/api/v1/users/Gaston/tokens", create},
++		{"DELETE", "/api/v1/users/gaston/tokens/" + resolution, ""},
++	} {
++		assert.NoError(t, call(d, c.method, c.path, c.body), "%s %s", c.method, c.path)
++	}
++	for _, c := range []struct{ method, path, body string }{
++		// another repository, several, none (all repositories)
++		{"POST", "/api/v1/users/gaston/tokens", `{"name":"` + resolution + `","scopes":["read:repository"],"repositories":[{"owner":"gaston","name":"app-b"}]}`},
++		{"POST", "/api/v1/users/gaston/tokens", `{"name":"` + resolution + `","scopes":["read:repository"],"repositories":[{"owner":"gaston","name":"app-a"},{"owner":"gaston","name":"app-b"}]}`},
++		{"POST", "/api/v1/users/gaston/tokens", `{"name":"` + resolution + `","scopes":["read:repository"]}`},
++		{"POST", "/api/v1/users/gaston/tokens", `{"name":"` + resolution + `","scopes":["read:repository"],"repositories":[{"owner":"alice","name":"app-a"}]}`},
++		// wider or other scopes, another name
++		{"POST", "/api/v1/users/gaston/tokens", `{"name":"` + resolution + `","scopes":["write:repository"],"repositories":[{"owner":"gaston","name":"app-a"}]}`},
++		{"POST", "/api/v1/users/gaston/tokens", `{"name":"` + resolution + `","scopes":["read:repository","read:user"],"repositories":[{"owner":"gaston","name":"app-a"}]}`},
++		{"POST", "/api/v1/users/gaston/tokens", `{"name":"` + resolution + `","scopes":["all"],"repositories":[{"owner":"gaston","name":"app-a"}]}`},
++		{"POST", "/api/v1/users/gaston/tokens", `{"name":"other","scopes":["read:repository"],"repositories":[{"owner":"gaston","name":"app-a"}]}`},
++		{"POST", "/api/v1/users/gaston/tokens", `{"name":"` + resolution + `","Name":"other","scopes":["read:repository"],"repositories":[{"owner":"gaston","name":"app-a"}]}`},
++		// another user's tokens, deletion by id or another name
++		{"POST", "/api/v1/users/alice/tokens", create},
++		{"GET", "/api/v1/users/alice/tokens", ""},
++		{"DELETE", "/api/v1/users/gaston/tokens/12", ""},
++		{"DELETE", "/api/v1/users/gaston/tokens/other", ""},
++		// a repository token is not repository or deploy-key authority
++		{"GET", "/api/v1/repos/gaston/app-a", ""},
++		{"POST", "/api/v1/repos/gaston/app-a/keys", `{"title":"pathops-build-app-a","key":"ssh-ed25519 AAAA","read_only":true}`},
++		{"GET", "/api/v1/user/applications/oauth2", ""},
++	} {
++		assert.ErrorIs(t, call(d, c.method, c.path, c.body), ErrDenied, "%s %s %s", c.method, c.path, c.body)
++	}
++	// create without revoke cannot delete
++	assert.ErrorIs(t, call(delegation(t, repositoryToken("app-a", "create")), "DELETE", "/api/v1/users/gaston/tokens/"+resolution, ""), ErrDenied)
++}
++
++func TestDeployKeyDetail(t *testing.T) {
++	d := delegation(t, deployKey("app-a"))
++	assert.NoError(t, call(d, "GET", "/api/v1/repos/gaston/app-a/keys", ""))
++	assert.NoError(t, call(d, "POST", "/api/v1/repos/gaston/app-a/keys", `{"title":"pathops-build-app-a","key":"ssh-ed25519 AAAA","read_only":true}`))
++	for _, c := range []struct{ method, path, body string }{
++		{"POST", "/api/v1/repos/gaston/app-a/keys", `{"title":"pathops-build-app-a","key":"ssh-ed25519 AAAA"}`}, // read_only defaults to false
++		{"POST", "/api/v1/repos/gaston/app-a/keys", `{"title":"pathops-build-app-a","key":"ssh-ed25519 AAAA","read_only":false}`},
++		{"POST", "/api/v1/repos/gaston/app-a/keys", `{"title":"pathops-build-app-a","key":"ssh-ed25519 AAAA","read_only":"true"}`},
++		{"POST", "/api/v1/repos/gaston/app-a/keys", `{"title":"pathops-build-app-a","key":"k","read_only":true,"Read_Only":false}`},
++		{"POST", "/api/v1/repos/gaston/app-a/keys", `{"title":"other","key":"ssh-ed25519 AAAA","read_only":true}`},
++		{"POST", "/api/v1/repos/gaston/app-b/keys", `{"title":"pathops-build-app-a","key":"ssh-ed25519 AAAA","read_only":true}`},
++		{"GET", "/api/v1/repos/gaston/app-b/keys", ""},
++		{"DELETE", "/api/v1/repos/gaston/app-a/keys/3", ""},
++		{"POST", "/api/v1/user/keys", `{"title":"pathops-build-app-a","key":"ssh-ed25519 AAAA"}`},
++		{"GET", "/api/v1/repos/gaston/app-a", ""},
++	} {
++		assert.ErrorIs(t, call(d, c.method, c.path, c.body), ErrDenied, "%s %s %s", c.method, c.path, c.body)
++	}
++}
++
++func TestRepositoryRead(t *testing.T) {
++	d := delegation(t, repo("app-a", "read"))
++	assert.NoError(t, call(d, "GET", "/api/v1/repos/gaston/app-a", ""))
++	assert.NoError(t, call(d, "GET", "/api/v1/repos/gaston/app-a/git/trees/0123abcd?recursive=true", ""))
++	for _, c := range []struct{ method, path, body string }{
++		{"POST", "/api/v1/user/repos", `{"name":"app-a"}`},
++		{"POST", "/api/v1/repos/gaston/app-a/contents", `{"files":[]}`},
++		{"GET", "/api/v1/repos/gaston/app-b", ""},
++	} {
++		assert.ErrorIs(t, call(d, c.method, c.path, c.body), ErrDenied, "%s %s %s", c.method, c.path, c.body)
++	}
++}
++
++func TestParseRepositoryTokenAndDeployKey(t *testing.T) {
++	with := func(base map[string]any, k string, v any) map[string]any {
++		m := map[string]any{}
++		for key, val := range base {
++			m[key] = val
++		}
++		if v == nil {
++			delete(m, k)
++		} else {
++			m[k] = v
++		}
++		return m
++	}
++	tok, key := repositoryToken("app-a", "create"), deployKey("app-a")
++	for name, detail := range map[string]map[string]any{
++		"token without name":          with(tok, "name", nil),
++		"token name parses as an id":  with(tok, "name", "0x1f"),
++		"token wider scopes":          with(tok, "scopes", []string{"read:repository", "write:repository"}),
++		"token other scope":           with(tok, "scopes", []string{"write:repository"}),
++		"token without scopes":        with(tok, "scopes", nil),
++		"token unknown action":        with(tok, "actions", []string{"delete"}),
++		"token with deploy key title": with(tok, "title", "x"),
++		"key without read_only":       with(key, "read_only", nil),
++		"key read_only false":         with(key, "read_only", false),
++		"key without title":           with(key, "title", nil),
++		"key unknown action":          with(key, "actions", []string{"delete"}),
++		"key with token scopes":       with(key, "scopes", []string{RepositoryTokenScope}),
++		"repository with key title":   with(repo("app-a", "read"), "title", "x"),
++		"webhook with token name":     with(webhook("app-a"), "name", resolution),
++	} {
++		_, err := Parse(map[string]any{"authorization_details": []any{detail}})
++		assert.Error(t, err, name)
++	}
++}
+-- 
+2.53.0
+

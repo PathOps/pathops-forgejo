@@ -26,7 +26,7 @@ if [ "${#changed[@]}" -gt 0 ]; then
   }
 fi
 
-packages=(./cmd/ ./modules/setting/ ./services/auth/... ./routers/api/shared/)
+packages=(./cmd/ ./modules/setting/ ./services/auth/... ./routers/api/shared/ ./routers/api/v1/permissions/)
 echo "test: go vet ${packages[*]}"
 go vet -tags "$TAGS" "${packages[@]}"
 
@@ -34,9 +34,12 @@ echo "test: go test ${packages[*]}"
 go test -tags "$TAGS" "${packages[@]}"
 
 echo "test: PathOps tests"
-out=$(go test -tags "$TAGS" -count=1 -v ./services/auth/pathops/ ./services/auth/method/ -run 'PathOps|TestSourceRepositoryToken|TestWebhookToken|TestParse')
+out=$(go test -tags "$TAGS" -count=1 -v ./services/auth/pathops/ ./services/auth/method/ ./routers/api/v1/permissions/ \
+  -run 'PathOps|TestSourceRepositoryToken|TestWebhookToken|TestParse|TestRepositoryTokenDetail|TestDeployKeyDetail|TestRepositoryRead')
 echo "$out" | grep -E -- '^--- (PASS|FAIL)'
-for t in TestSourceRepositoryToken TestWebhookToken TestParse TestAuthorizedIntegrationPathOps; do
+for t in TestSourceRepositoryToken TestWebhookToken TestParse TestAuthorizedIntegrationPathOps \
+  TestRepositoryTokenDetail TestDeployKeyDetail TestRepositoryRead TestParseRepositoryTokenAndDeployKey \
+  TestReqBasicOrRevProxyAuthPathOps; do
   grep -q -- "--- PASS: $t " <<<"$out" || {
     echo "test: $t did not run and pass" >&2
     exit 1

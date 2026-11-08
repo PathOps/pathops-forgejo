@@ -14,6 +14,11 @@ Current patch set:
   Dex without the web UI; `--reuse-existing` makes it idempotent.
 - `0002`: enforcement of PathOps delegated `authorization_details` (RFC 9396) on
   the API, for tokens of the configured PathOps delegation issuer.
+- `0003`: the BUILD_AND_PUSH vocabulary (PathOps Decision 0056): a
+  repository-scoped read token for the Tekton resolver, a read-only deploy key
+  for the build's checkout, and a read-only repository action. Access token
+  creation and deletion (basic-auth-only routes) accept a delegated token for
+  exactly what its details authorize.
 
 Without the PathOps settings, behavior is identical to upstream.
 
@@ -58,10 +63,15 @@ runs**; anything not listed is `403`:
 |---|---|
 | `GET /user` | any PathOps token |
 | `POST /user/repos` `{name}` | `pathops_repository` `create` of `name` (owner = the token's user) |
-| `GET /repos/{o}/{r}`, `.../branches/{b}`, `.../git/trees/{sha}` | `pathops_repository` `create` or `seed` of `o/r` |
+| `GET /repos/{o}/{r}`, `.../branches/{b}`, `.../git/trees/{sha}` | `pathops_repository` `create`, `seed` or `read` of `o/r` |
 | `POST /repos/{o}/{r}/contents` | `pathops_repository` `seed` of `o/r` |
 | `GET /repos/{o}/{r}/hooks` | `pathops_webhook` `configure` of `o/r` |
 | `POST /repos/{o}/{r}/hooks`, `PATCH .../hooks/{id}` | `pathops_webhook` `configure` of `o/r`, with exactly its `url` and events among its `events` |
+| `GET /users/{o}/tokens` | any `pathops_repository_token` |
+| `POST /users/{o}/tokens` `{name, scopes, repositories}` | `pathops_repository_token` `create`: exactly its `name`, its `scopes` (`["read:repository"]`) and the one repository `o/r` |
+| `DELETE /users/{o}/tokens/{name}` | `pathops_repository_token` `revoke` of that exact name (never an id) |
+| `GET /repos/{o}/{r}/keys` | `pathops_deploy_key` `configure` of `o/r` |
+| `POST /repos/{o}/{r}/keys` `{title, key, read_only}` | `pathops_deploy_key` `configure` of `o/r`: its `title`, `read_only` present and `true` |
 
 Detail vocabulary v1:
 
@@ -71,7 +81,19 @@ Detail vocabulary v1:
 {"type": "pathops_webhook", "version": 1, "tool": "forgejo",
  "owner": "gaston", "repository": "app-a", "url": "http://.../webhooks/forgejo/<app id>",
  "events": ["push"], "actions": ["configure"]}
+{"type": "pathops_repository_token", "version": 1, "tool": "forgejo",
+ "owner": "gaston", "repository": "app-a", "name": "pathops-resolution-<app id>",
+ "scopes": ["read:repository"], "actions": ["create", "revoke"]}
+{"type": "pathops_deploy_key", "version": 1, "tool": "forgejo",
+ "owner": "gaston", "repository": "app-a", "title": "pathops-checkout-<app id>",
+ "read_only": true, "actions": ["configure"]}
 ```
+
+`pathops_repository` actions are `create`, `seed` and `read`. A repository
+token is created as the user's access token, readable only for that one
+repository; `revoke` deletes an orphan of the same name (when the answer of
+its creation was lost). A deploy key is never deleted through a delegated
+token.
 
 Bodies that are checked are rejected when two keys of an object are equal
 ignoring case, and escaped paths are refused, so the value checked is the value
@@ -113,7 +135,8 @@ Requirements: `git`, Go (the version in upstream `go.mod`), Docker with BuildKit
 ```
 
 `test.sh` runs the tests of the packages the patches touch (`cmd`,
-`modules/setting`, `services/auth/...`, `routers/api/shared`), with
+`modules/setting`, `services/auth/...`, `routers/api/shared`,
+`routers/api/v1/permissions`), with
 `TZ=UTC` because upstream claim tests compare times in the local zone.
 
 ## Versioning and upstream policy
