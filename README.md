@@ -19,6 +19,10 @@ Current patch set:
   for the build's checkout, and a read-only repository action. Access token
   creation and deletion (basic-auth-only routes) accept a delegated token for
   exactly what its details authorize.
+- `0004`: Dex-first sign-in (PathOps Decision 0059): `/user/login` redirects to
+  the configured OAuth2 source (the Cell's Dex) and offers no local form;
+  Forgejo-local username/password sign-in is served only at the unlinked
+  recovery route `/user/login/break-glass`, which does not depend on Dex.
 
 Without the PathOps settings, behavior is identical to upstream.
 
@@ -46,6 +50,13 @@ ALLOWED_DOMAINS = dex-<cell>.example.org         ; upstream setting
 ; PathOps (0002): tokens of this issuer carry PathOps authorization_details
 PATHOPS_DELEGATION_ISSUER = https://dex-<cell>.example.org
 PATHOPS_DELEGATION_AUTHORIZED_PARTY = pathops-tenant-control-plane
+```
+
+```ini
+[service]
+; PathOps (0004): the OAuth2 authentication source (its unique name) that is
+; the normal interactive sign-in
+PATHOPS_LOGIN_SOURCE = dex
 ```
 
 A token whose `iss` is `PATHOPS_DELEGATION_ISSUER` is accepted only when:
@@ -99,6 +110,24 @@ Bodies that are checked are rejected when two keys of an object are equal
 ignoring case, and escaped paths are refused, so the value checked is the value
 the handler uses.
 
+## Sign-in (0004)
+
+With `PATHOPS_LOGIN_SOURCE` set:
+
+| Request | Answer |
+|---|---|
+| `GET /user/login` | `303` to `/user/oauth2/<source>` (`redirect_to` kept in its cookie; a signed-in user is redirected as upstream); `503` without a local form when the name is not an active OAuth2 source (never a fallback to local sign-in) |
+| `POST /user/login` | `403`: local credentials are not accepted here |
+| `GET /user/login/break-glass` | the upstream local sign-in form, without the OAuth2 sources, posting to itself |
+| `POST /user/login/break-glass` | the upstream local sign-in (2FA, captcha, remember-me unchanged) |
+
+The break-glass route is not linked from any page, needs nothing from the
+OAuth2 provider (it works while Dex is down) and exists only while
+`ENABLE_INTERNAL_SIGNIN` is true. It is for a Forgejo-local recovery account,
+never for automation. The OAuth2 sign-in and callback, auto-registration and
+account linking are upstream's. Without the setting, `/user/login` is upstream's
+and `/user/login/break-glass` is `404`.
+
 ## Onboarding
 
 Cell onboarding, with operator (bootstrap) authority, never the TCP's:
@@ -136,8 +165,11 @@ Requirements: `git`, Go (the version in upstream `go.mod`), Docker with BuildKit
 
 `test.sh` runs the tests of the packages the patches touch (`cmd`,
 `modules/setting`, `services/auth/...`, `routers/api/shared`,
-`routers/api/v1/permissions`), with
-`TZ=UTC` because upstream claim tests compare times in the local zone.
+`routers/api/v1/permissions`, `routers/web/auth`) and the integration tests
+(SQLite) of the sign-in routes plus upstream's sign-in, OAuth2 and 2FA
+integration tests, with `TZ=UTC` because upstream claim tests compare times in
+the local zone. `TEST_SSH_PORT` moves the integration server's SSH port when
+upstream's 2203 is taken on the machine.
 
 ## Versioning and upstream policy
 
