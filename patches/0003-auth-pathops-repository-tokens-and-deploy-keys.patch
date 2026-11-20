@@ -1,12 +1,12 @@
-From 932e266beef6424c9f1962a0f112cd7495ab15c9 Mon Sep 17 00:00:00 2001
+From fbd656624fea28898c504fd4dc5c32707affd15a Mon Sep 17 00:00:00 2001
 From: PathOps <noreply@pathops.dev>
 Date: Sat, 7 Nov 2026 23:41:28 -0300
 Subject: [PATCH] auth: PathOps repository tokens and deploy keys for
  BUILD_AND_PUSH
 
-PathOps Decision 0056 provisions an Application's BUILD_AND_PUSH access
-as the user, with delegated tokens, in two read-only credentials of the
-source repository:
+PathOps Decisions 0056 and 0064 provision an Application's delivery
+access as the user, with delegated tokens, in credentials of exactly one
+repository each:
 
 - pathops_repository_token (owner, repository, name, scopes
   ["read:repository"], actions create|revoke): list the user's access
@@ -14,9 +14,12 @@ source repository:
   repository (the Tekton resolver's), and delete it by that exact name
   (an orphan left when the creation's answer was lost). The name can
   never be taken for a token id.
-- pathops_deploy_key (owner, repository, title, read_only true, actions
-  configure): list the repository's deploy keys and add one with that
-  title, read_only present and true (it defaults to false).
+- pathops_deploy_key (owner, repository, title, read_only true|false,
+  actions configure): list the repository's deploy keys and add one with
+  that title and exactly that read_only, always explicit (it defaults to
+  false upstream): read-only for a build's checkout or a deployment's
+  read, writable for a GitOps update's push (Decision 0064). A detail of
+  one access never creates a key of the other.
 - pathops_repository gains the read action: the repository and its git
   trees, without the create/seed write authority.
 
@@ -25,11 +28,11 @@ ReqBasicOrRevProxyAuth lets a PathOps delegated token through them,
 since its authorization_details authorized the exact request before
 routing. Every other token is still refused there.
 ---
- .../req_basic_or_rev_proxy_auth.go            |   9 ++
- ...eq_basic_or_rev_proxy_auth_pathops_test.go |  59 ++++++++
- services/auth/pathops/pathops.go              | 137 ++++++++++++++++--
- services/auth/pathops/pathops_test.go         | 119 +++++++++++++++
- 4 files changed, 312 insertions(+), 12 deletions(-)
+ .../req_basic_or_rev_proxy_auth.go            |   9 +
+ ...eq_basic_or_rev_proxy_auth_pathops_test.go |  59 ++++++
+ services/auth/pathops/pathops.go              | 146 +++++++++++++--
+ services/auth/pathops/pathops_test.go         | 169 ++++++++++++++++++
+ 4 files changed, 371 insertions(+), 12 deletions(-)
  create mode 100644 routers/api/v1/permissions/req_basic_or_rev_proxy_auth_pathops_test.go
 
 diff --git a/routers/api/v1/permissions/req_basic_or_rev_proxy_auth.go b/routers/api/v1/permissions/req_basic_or_rev_proxy_auth.go
@@ -125,10 +128,10 @@ index 0000000..fe63da2
 +	}
 +}
 diff --git a/services/auth/pathops/pathops.go b/services/auth/pathops/pathops.go
-index 178b9c1..9c4f75a 100644
+index 178b9c1..e1e2d9f 100644
 --- a/services/auth/pathops/pathops.go
 +++ b/services/auth/pathops/pathops.go
-@@ -16,20 +16,37 @@
+@@ -16,20 +16,39 @@
  //
  // Detail vocabulary v1 (tool "forgejo"):
  //
@@ -138,8 +141,8 @@ index 178b9c1..9c4f75a 100644
 +//	pathops_webhook           owner, repository, url, events, actions configure
 +//	pathops_repository_token  owner, repository, name, scopes ["read:repository"],
 +//	                          actions create|revoke
-+//	pathops_deploy_key        owner, repository, title, read_only true,
-+//	                          actions configure
++//	pathops_deploy_key        owner, repository, title, read_only (true or
++//	                          false, always explicit), actions configure
  //
  // API calls allowed (owner must be the token's user):
  //
@@ -158,18 +161,20 @@ index 178b9c1..9c4f75a 100644
 +//	     repositories}                          name, scopes and repository o/r
 +//	DELETE /users/{o}/tokens/{name}             repository token revoke of that name
 +//	GET  /repos/{o}/{r}/keys                    deploy key configure of r
-+//	POST /repos/{o}/{r}/keys {title, key,       deploy key configure of r: its title,
-+//	     read_only}                             read_only literally true
++//	POST /repos/{o}/{r}/keys {title, key,       deploy key configure of r: its title
++//	     read_only}                             and exactly its read_only, explicit
 +//
 +// A repository token is a user access token readable only for one repository
-+// (the Tekton resolver's); a deploy key is a read-only SSH key of one
-+// repository (the build's checkout). Token creation and deletion otherwise
++// (the Tekton resolver's); a deploy key is an SSH key of one repository with
++// exactly the access its detail names: read-only (a build's checkout, a
++// deployment's read) or writable (a GitOps update's push). A detail of one
++// never authorizes the other. Token creation and deletion otherwise
 +// require basic authentication; a delegated token reaches them only for what
 +// its details authorize (routers/api/v1/permissions).
  package pathops
  
  import (
-@@ -42,16 +59,22 @@ import (
+@@ -42,16 +61,22 @@ import (
  	"net/url"
  	"regexp"
  	"slices"
@@ -195,7 +200,7 @@ index 178b9c1..9c4f75a 100644
  // Detail is one forgejo authorization detail.
  type Detail struct {
  	Type       string   `json:"type"`
-@@ -61,7 +84,13 @@ type Detail struct {
+@@ -61,7 +86,13 @@ type Detail struct {
  	Repository string   `json:"repository"`
  	URL        string   `json:"url,omitempty"`
  	Events     []string `json:"events,omitempty"`
@@ -210,7 +215,7 @@ index 178b9c1..9c4f75a 100644
  }
  
  // Delegation is the PathOps authority of one token.
-@@ -77,8 +106,10 @@ var ErrDenied = errors.New("pathops delegation: not authorized by the token's au
+@@ -77,8 +108,10 @@ var ErrDenied = errors.New("pathops delegation: not authorized by the token's au
  var name = regexp.MustCompile(`^[A-Za-z0-9._-]{1,100}$`)
  
  var allowed = map[string][]string{
@@ -223,7 +228,7 @@ index 178b9c1..9c4f75a 100644
  }
  
  // Parse reads and validates the PathOps claims of a token: azp and a
-@@ -130,10 +161,18 @@ func (dt Detail) validate() error {
+@@ -130,10 +163,18 @@ func (dt Detail) validate() error {
  		return errors.New("pathops delegation: detail owner/repository invalid")
  	case len(dt.Actions) == 0:
  		return errors.New("pathops delegation: detail without actions")
@@ -239,12 +244,12 @@ index 178b9c1..9c4f75a 100644
 +		return errors.New("pathops delegation: repository token detail without a valid name")
 +	case dt.Type == TypeRepositoryToken && !slices.Equal(dt.Scopes, []string{RepositoryTokenScope}):
 +		return fmt.Errorf("pathops delegation: a repository token's scopes are exactly [%s]", RepositoryTokenScope)
-+	case dt.Type == TypeDeployKey && (!name.MatchString(dt.Title) || dt.ReadOnly == nil || !*dt.ReadOnly):
-+		return errors.New("pathops delegation: a deploy key detail needs a title and read_only true")
++	case dt.Type == TypeDeployKey && (!name.MatchString(dt.Title) || dt.ReadOnly == nil):
++		return errors.New("pathops delegation: a deploy key detail needs a title and an explicit read_only")
  	}
  	for _, a := range dt.Actions {
  		if !slices.Contains(acts, a) {
-@@ -143,6 +182,13 @@ func (dt Detail) validate() error {
+@@ -143,6 +184,13 @@ func (dt Detail) validate() error {
  	return nil
  }
  
@@ -258,7 +263,7 @@ index 178b9c1..9c4f75a 100644
  func (d *Delegation) find(typ, owner, repo, action string) *Detail {
  	for i, dt := range d.Details {
  		if dt.Type == typ && strings.EqualFold(dt.Owner, owner) && strings.EqualFold(dt.Repository, repo) &&
-@@ -196,13 +242,59 @@ func (d *Delegation) Authorize(r *http.Request, login, apiPrefix string) error {
+@@ -196,13 +244,59 @@ func (d *Delegation) Authorize(r *http.Request, login, apiPrefix string) error {
  			return fmt.Errorf("%w: %s/%s is not the token user's", ErrDenied, owner, repo)
  		}
  		return d.repository(r, owner, repo, sub)
@@ -319,7 +324,7 @@ index 178b9c1..9c4f75a 100644
  	switch {
  	case m == http.MethodGet && len(sub) == 0, // the repository
  		m == http.MethodGet && len(sub) == 2 && sub[0] == "branches",
-@@ -242,6 +334,27 @@ func (d *Delegation) repository(r *http.Request, owner, repo string, sub []strin
+@@ -242,6 +336,34 @@ func (d *Delegation) repository(r *http.Request, owner, repo string, sub []strin
  			}
  		}
  		return nil
@@ -328,8 +333,7 @@ index 178b9c1..9c4f75a 100644
 +			return nil
 +		}
 +	case m == http.MethodPost && len(sub) == 1 && sub[0] == "keys":
-+		dt := d.find(TypeDeployKey, owner, repo, "configure")
-+		if dt == nil {
++		if d.find(TypeDeployKey, owner, repo, "configure") == nil {
 +			break
 +		}
 +		var body struct {
@@ -339,19 +343,27 @@ index 178b9c1..9c4f75a 100644
 +		if err := readJSON(r, &body); err != nil {
 +			return err
 +		}
-+		// read_only defaults to false: it must be present and true.
-+		if body.Title != dt.Title || body.ReadOnly == nil || !*body.ReadOnly {
-+			return fmt.Errorf("%w: deploy key %q of %s/%s must be read-only with the approved title", ErrDenied, body.Title, owner, repo)
++		// read_only defaults to false upstream: the request states it, and
++		// it is exactly the approved detail's (a read-only detail never
++		// creates a writable key, nor a writable detail a read-only one).
++		if body.ReadOnly == nil {
++			return fmt.Errorf("%w: deploy key %q of %s/%s without an explicit read_only", ErrDenied, body.Title, owner, repo)
 +		}
-+		return nil
++		for _, dt := range d.Details {
++			if dt.Type == TypeDeployKey && strings.EqualFold(dt.Owner, owner) && strings.EqualFold(dt.Repository, repo) &&
++				slices.Contains(dt.Actions, "configure") && body.Title == dt.Title && *body.ReadOnly == *dt.ReadOnly {
++				return nil
++			}
++		}
++		return fmt.Errorf("%w: deploy key %q (read_only %t) of %s/%s is not the approved one", ErrDenied, body.Title, *body.ReadOnly, owner, repo)
  	}
  	return fmt.Errorf("%w: %s %s", ErrDenied, m, r.URL.Path)
  }
 diff --git a/services/auth/pathops/pathops_test.go b/services/auth/pathops/pathops_test.go
-index 19bcaf7..8faf57a 100644
+index 19bcaf7..1f98b0a 100644
 --- a/services/auth/pathops/pathops_test.go
 +++ b/services/auth/pathops/pathops_test.go
-@@ -156,3 +156,122 @@ func TestParse(t *testing.T) {
+@@ -156,3 +156,172 @@ func TestParse(t *testing.T) {
  		assert.Error(t, err, name)
  	}
  }
@@ -366,6 +378,11 @@ index 19bcaf7..8faf57a 100644
 +func deployKey(name string) map[string]any {
 +	return map[string]any{"type": TypeDeployKey, "version": 1, "tool": "forgejo", "owner": "gaston", "repository": name,
 +		"title": "pathops-build-app-a", "read_only": true, "actions": []string{"configure"}}
++}
++
++func writeKey(name string) map[string]any {
++	return map[string]any{"type": TypeDeployKey, "version": 1, "tool": "forgejo", "owner": "gaston", "repository": name,
++		"title": "pathops-preflight-write-app-a", "read_only": false, "actions": []string{"configure"}}
 +}
 +
 +func TestRepositoryTokenDetail(t *testing.T) {
@@ -427,6 +444,51 @@ index 19bcaf7..8faf57a 100644
 +	}
 +}
 +
++// A writable deploy key detail (a GitOps update's push) creates exactly that
++// writable key; a read-only detail never creates a writable key and a
++// writable one never a read-only key; read_only is always explicit.
++func TestWritableDeployKeyDetail(t *testing.T) {
++	const ok = `{"title":"pathops-preflight-write-app-a","key":"ssh-ed25519 AAAA","read_only":false}`
++	d := delegation(t, writeKey("app-a-gitops-preflight"))
++	assert.NoError(t, call(d, "GET", "/api/v1/repos/gaston/app-a-gitops-preflight/keys", ""))
++	assert.NoError(t, call(d, "POST", "/api/v1/repos/gaston/app-a-gitops-preflight/keys", ok))
++	for _, c := range []struct{ method, path, body string }{
++		// read_only omitted (upstream default false) or the other value
++		{"POST", "/api/v1/repos/gaston/app-a-gitops-preflight/keys", `{"title":"pathops-preflight-write-app-a","key":"ssh-ed25519 AAAA"}`},
++		{"POST", "/api/v1/repos/gaston/app-a-gitops-preflight/keys", `{"title":"pathops-preflight-write-app-a","key":"ssh-ed25519 AAAA","read_only":true}`},
++		{"POST", "/api/v1/repos/gaston/app-a-gitops-preflight/keys", `{"title":"pathops-preflight-write-app-a","key":"ssh-ed25519 AAAA","read_only":"false"}`},
++		{"POST", "/api/v1/repos/gaston/app-a-gitops-preflight/keys", `{"title":"pathops-preflight-write-app-a","key":"k","read_only":false,"Read_Only":true}`},
++		// another title, another repository (the source, another Application's)
++		{"POST", "/api/v1/repos/gaston/app-a-gitops-preflight/keys", `{"title":"other","key":"ssh-ed25519 AAAA","read_only":false}`},
++		{"POST", "/api/v1/repos/gaston/app-a/keys", ok},
++		{"POST", "/api/v1/repos/gaston/app-b-gitops-preflight/keys", ok},
++		{"POST", "/api/v1/repos/alice/app-a-gitops-preflight/keys", ok},
++		// no deletion, no user keys, no repository authority
++		{"DELETE", "/api/v1/repos/gaston/app-a-gitops-preflight/keys/3", ""},
++		{"POST", "/api/v1/user/keys", `{"title":"pathops-preflight-write-app-a","key":"ssh-ed25519 AAAA"}`},
++		{"GET", "/api/v1/repos/gaston/app-a-gitops-preflight", ""},
++	} {
++		assert.ErrorIs(t, call(d, c.method, c.path, c.body), ErrDenied, "%s %s %s", c.method, c.path, c.body)
++	}
++	// A read-only detail cannot create the writable key of the same title.
++	ro := writeKey("app-a-gitops-preflight")
++	ro["read_only"] = true
++	assert.ErrorIs(t, call(delegation(t, ro), "POST", "/api/v1/repos/gaston/app-a-gitops-preflight/keys", ok), ErrDenied)
++	// Both details of one repository: each creates only its own key.
++	both := delegation(t, writeKey("app-a-gitops-preflight"), map[string]any{"type": TypeDeployKey, "version": 1, "tool": "forgejo",
++		"owner": "gaston", "repository": "app-a-gitops-preflight", "title": "pathops-preflight-read-app-a", "read_only": true,
++		"actions": []string{"configure"}})
++	assert.NoError(t, call(both, "POST", "/api/v1/repos/gaston/app-a-gitops-preflight/keys", ok))
++	assert.NoError(t, call(both, "POST", "/api/v1/repos/gaston/app-a-gitops-preflight/keys",
++		`{"title":"pathops-preflight-read-app-a","key":"ssh-ed25519 AAAA","read_only":true}`))
++	for _, body := range []string{
++		`{"title":"pathops-preflight-read-app-a","key":"ssh-ed25519 AAAA","read_only":false}`,
++		`{"title":"pathops-preflight-write-app-a","key":"ssh-ed25519 AAAA","read_only":true}`,
++	} {
++		assert.ErrorIs(t, call(both, "POST", "/api/v1/repos/gaston/app-a-gitops-preflight/keys", body), ErrDenied, body)
++	}
++}
++
 +func TestRepositoryRead(t *testing.T) {
 +	d := delegation(t, repo("app-a", "read"))
 +	assert.NoError(t, call(d, "GET", "/api/v1/repos/gaston/app-a", ""))
@@ -463,7 +525,7 @@ index 19bcaf7..8faf57a 100644
 +		"token unknown action":        with(tok, "actions", []string{"delete"}),
 +		"token with deploy key title": with(tok, "title", "x"),
 +		"key without read_only":       with(key, "read_only", nil),
-+		"key read_only false":         with(key, "read_only", false),
++		"key read_only a string":      with(key, "read_only", "false"),
 +		"key without title":           with(key, "title", nil),
 +		"key unknown action":          with(key, "actions", []string{"delete"}),
 +		"key with token scopes":       with(key, "scopes", []string{RepositoryTokenScope}),

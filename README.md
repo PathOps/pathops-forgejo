@@ -14,9 +14,11 @@ Current patch set:
   Dex without the web UI; `--reuse-existing` makes it idempotent.
 - `0002`: enforcement of PathOps delegated `authorization_details` (RFC 9396) on
   the API, for tokens of the configured PathOps delegation issuer.
-- `0003`: the BUILD_AND_PUSH vocabulary (PathOps Decision 0056): a
-  repository-scoped read token for the Tekton resolver, a read-only deploy key
-  for the build's checkout, and a read-only repository action. Access token
+- `0003`: the delivery vocabulary (PathOps Decisions 0056, 0064): a
+  repository-scoped read token for the Tekton resolver, deploy keys with an
+  explicit `read_only` (read-only for a build's checkout or a deployment's
+  read, writable for a Preflight GitOps update's push), and a read-only
+  repository action. Access token
   creation and deletion (basic-auth-only routes) accept a delegated token for
   exactly what its details authorize.
 - `0004`: Dex-first sign-in (PathOps Decision 0059): `/user/login` redirects to
@@ -82,7 +84,7 @@ runs**; anything not listed is `403`:
 | `POST /users/{o}/tokens` `{name, scopes, repositories}` | `pathops_repository_token` `create`: exactly its `name`, its `scopes` (`["read:repository"]`) and the one repository `o/r` |
 | `DELETE /users/{o}/tokens/{name}` | `pathops_repository_token` `revoke` of that exact name (never an id) |
 | `GET /repos/{o}/{r}/keys` | `pathops_deploy_key` `configure` of `o/r` |
-| `POST /repos/{o}/{r}/keys` `{title, key, read_only}` | `pathops_deploy_key` `configure` of `o/r`: its `title`, `read_only` present and `true` |
+| `POST /repos/{o}/{r}/keys` `{title, key, read_only}` | `pathops_deploy_key` `configure` of `o/r`: its `title` and exactly its `read_only`, present in the request |
 
 Detail vocabulary v1:
 
@@ -103,8 +105,13 @@ Detail vocabulary v1:
 `pathops_repository` actions are `create`, `seed` and `read`. A repository
 token is created as the user's access token, readable only for that one
 repository; `revoke` deletes an orphan of the same name (when the answer of
-its creation was lost). A deploy key is never deleted through a delegated
-token.
+its creation was lost). A deploy key detail always states `read_only`
+(`true` or `false`); the request must state the same value (upstream defaults
+an omitted `read_only` to `false`, so omitting it is refused), so a read-only
+detail never creates a writable key and a writable detail never a read-only
+one. A deploy key is never deleted through a delegated token. Deploy keys
+created without a PathOps delegated token (a person, any other token) keep
+upstream's behavior, read-only or writable.
 
 Bodies that are checked are rejected when two keys of an object are equal
 ignoring case, and escaped paths are refused, so the value checked is the value
