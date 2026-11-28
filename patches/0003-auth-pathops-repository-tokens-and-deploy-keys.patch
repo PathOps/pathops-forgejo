@@ -1,4 +1,4 @@
-From fbd656624fea28898c504fd4dc5c32707affd15a Mon Sep 17 00:00:00 2001
+From 35b1d3b4e45d63780d8c4f654050d70812f7bfad Mon Sep 17 00:00:00 2001
 From: PathOps <noreply@pathops.dev>
 Date: Sat, 7 Nov 2026 23:41:28 -0300
 Subject: [PATCH] auth: PathOps repository tokens and deploy keys for
@@ -30,9 +30,9 @@ routing. Every other token is still refused there.
 ---
  .../req_basic_or_rev_proxy_auth.go            |   9 +
  ...eq_basic_or_rev_proxy_auth_pathops_test.go |  59 ++++++
- services/auth/pathops/pathops.go              | 146 +++++++++++++--
+ services/auth/pathops/pathops.go              | 154 ++++++++++++++--
  services/auth/pathops/pathops_test.go         | 169 ++++++++++++++++++
- 4 files changed, 371 insertions(+), 12 deletions(-)
+ 4 files changed, 375 insertions(+), 16 deletions(-)
  create mode 100644 routers/api/v1/permissions/req_basic_or_rev_proxy_auth_pathops_test.go
 
 diff --git a/routers/api/v1/permissions/req_basic_or_rev_proxy_auth.go b/routers/api/v1/permissions/req_basic_or_rev_proxy_auth.go
@@ -128,17 +128,15 @@ index 0000000..fe63da2
 +	}
 +}
 diff --git a/services/auth/pathops/pathops.go b/services/auth/pathops/pathops.go
-index 178b9c1..e1e2d9f 100644
+index 306318f..848bb8a 100644
 --- a/services/auth/pathops/pathops.go
 +++ b/services/auth/pathops/pathops.go
-@@ -16,20 +16,39 @@
+@@ -16,18 +16,36 @@
  //
  // Detail vocabulary v1 (tool "forgejo"):
  //
 -//	pathops_repository  owner, repository, actions create|seed
--//	pathops_webhook     owner, repository, url, events, actions configure
 +//	pathops_repository        owner, repository, actions create|seed|read
-+//	pathops_webhook           owner, repository, url, events, actions configure
 +//	pathops_repository_token  owner, repository, name, scopes ["read:repository"],
 +//	                          actions create|revoke
 +//	pathops_deploy_key        owner, repository, title, read_only (true or
@@ -152,10 +150,6 @@ index 178b9c1..e1e2d9f 100644
 +//	GET  /repos/{o}/{r}, .../branches/{b},      repository create, seed or read of r
  //	     .../git/trees/{sha}
  //	POST /repos/{o}/{r}/contents                repository seed of r
- //	GET  /repos/{o}/{r}/hooks                   webhook configure of r
- //	POST /repos/{o}/{r}/hooks {config.url,      webhook configure of r: the url,
- //	     events}                                and events among the detail's
- //	PATCH /repos/{o}/{r}/hooks/{id} {same}      same
 +//	GET  /users/{o}/tokens                      repository token create or revoke
 +//	POST /users/{o}/tokens {name, scopes,       repository token create: exactly its
 +//	     repositories}                          name, scopes and repository o/r
@@ -163,18 +157,22 @@ index 178b9c1..e1e2d9f 100644
 +//	GET  /repos/{o}/{r}/keys                    deploy key configure of r
 +//	POST /repos/{o}/{r}/keys {title, key,       deploy key configure of r: its title
 +//	     read_only}                             and exactly its read_only, explicit
-+//
+ //
+-// No detail authorizes a repository webhook (PathOps Decision 0070: a
+-// Delivery is an explicit request to the Tenant CP, never a push).
 +// A repository token is a user access token readable only for one repository
 +// (the Tekton resolver's); a deploy key is an SSH key of one repository with
 +// exactly the access its detail names: read-only (a build's checkout, a
 +// deployment's read) or writable (a GitOps update's push). A detail of one
 +// never authorizes the other. Token creation and deletion otherwise
 +// require basic authentication; a delegated token reaches them only for what
-+// its details authorize (routers/api/v1/permissions).
++// its details authorize (routers/api/v1/permissions). No detail authorizes a
++// repository webhook (PathOps Decision 0070: a Delivery is an explicit
++// request to the Tenant CP, never a push).
  package pathops
  
  import (
-@@ -42,16 +61,22 @@ import (
+@@ -40,23 +58,35 @@ import (
  	"net/url"
  	"regexp"
  	"slices"
@@ -185,10 +183,8 @@ index 178b9c1..e1e2d9f 100644
  // Detail types and actions of vocabulary v1.
  const (
 -	TypeRepository = "pathops_repository"
--	TypeWebhook    = "pathops_webhook"
 -	Tool           = "forgejo"
 +	TypeRepository      = "pathops_repository"
-+	TypeWebhook         = "pathops_webhook"
 +	TypeRepositoryToken = "pathops_repository_token"
 +	TypeDeployKey       = "pathops_deploy_key"
 +	Tool                = "forgejo"
@@ -199,12 +195,17 @@ index 178b9c1..e1e2d9f 100644
 +
  // Detail is one forgejo authorization detail.
  type Detail struct {
- 	Type       string   `json:"type"`
-@@ -61,7 +86,13 @@ type Detail struct {
- 	Repository string   `json:"repository"`
- 	URL        string   `json:"url,omitempty"`
- 	Events     []string `json:"events,omitempty"`
+-	Type       string   `json:"type"`
+-	Version    int      `json:"version"`
+-	Tool       string   `json:"tool"`
+-	Owner      string   `json:"owner"`
+-	Repository string   `json:"repository"`
 -	Actions    []string `json:"actions"`
++	Type       string `json:"type"`
++	Version    int    `json:"version"`
++	Tool       string `json:"tool"`
++	Owner      string `json:"owner"`
++	Repository string `json:"repository"`
 +	// Name and Scopes of a repository token.
 +	Name   string   `json:"name,omitempty"`
 +	Scopes []string `json:"scopes,omitempty"`
@@ -215,31 +216,24 @@ index 178b9c1..e1e2d9f 100644
  }
  
  // Delegation is the PathOps authority of one token.
-@@ -77,8 +108,10 @@ var ErrDenied = errors.New("pathops delegation: not authorized by the token's au
+@@ -72,7 +102,9 @@ var ErrDenied = errors.New("pathops delegation: not authorized by the token's au
  var name = regexp.MustCompile(`^[A-Za-z0-9._-]{1,100}$`)
  
  var allowed = map[string][]string{
 -	TypeRepository: {"create", "seed"},
--	TypeWebhook:    {"configure"},
 +	TypeRepository:      {"create", "seed", "read"},
-+	TypeWebhook:         {"configure"},
 +	TypeRepositoryToken: {"create", "revoke"},
 +	TypeDeployKey:       {"configure"},
  }
  
  // Parse reads and validates the PathOps claims of a token: azp and a
-@@ -130,10 +163,18 @@ func (dt Detail) validate() error {
+@@ -124,6 +156,15 @@ func (dt Detail) validate() error {
  		return errors.New("pathops delegation: detail owner/repository invalid")
  	case len(dt.Actions) == 0:
  		return errors.New("pathops delegation: detail without actions")
-+	case (dt.Type != TypeWebhook && (dt.URL != "" || len(dt.Events) != 0)) ||
-+		(dt.Type != TypeRepositoryToken && (dt.Name != "" || len(dt.Scopes) != 0)) ||
++	case (dt.Type != TypeRepositoryToken && (dt.Name != "" || len(dt.Scopes) != 0)) ||
 +		(dt.Type != TypeDeployKey && (dt.Title != "" || dt.ReadOnly != nil)):
 +		return fmt.Errorf("pathops delegation: %s detail with fields of another type", dt.Type)
- 	case dt.Type == TypeWebhook && (dt.URL == "" || len(dt.Events) == 0):
- 		return errors.New("pathops delegation: webhook detail without url or events")
--	case dt.Type == TypeRepository && (dt.URL != "" || len(dt.Events) != 0):
--		return errors.New("pathops delegation: repository detail with webhook fields")
 +	case dt.Type == TypeRepositoryToken && !tokenName(dt.Name):
 +		return errors.New("pathops delegation: repository token detail without a valid name")
 +	case dt.Type == TypeRepositoryToken && !slices.Equal(dt.Scopes, []string{RepositoryTokenScope}):
@@ -249,7 +243,7 @@ index 178b9c1..e1e2d9f 100644
  	}
  	for _, a := range dt.Actions {
  		if !slices.Contains(acts, a) {
-@@ -143,6 +184,13 @@ func (dt Detail) validate() error {
+@@ -133,6 +174,13 @@ func (dt Detail) validate() error {
  	return nil
  }
  
@@ -263,7 +257,18 @@ index 178b9c1..e1e2d9f 100644
  func (d *Delegation) find(typ, owner, repo, action string) *Detail {
  	for i, dt := range d.Details {
  		if dt.Type == typ && strings.EqualFold(dt.Owner, owner) && strings.EqualFold(dt.Repository, repo) &&
-@@ -196,13 +244,59 @@ func (d *Delegation) Authorize(r *http.Request, login, apiPrefix string) error {
+@@ -143,8 +191,8 @@ func (d *Delegation) find(typ, owner, repo, action string) *Detail {
+ 	return nil
+ }
+ 
+-// maxBody bounds the request bodies read for a decision (a repository
+-// creation is small).
++// maxBody bounds the request bodies read for a decision (repository and
++// token creation are small).
+ const maxBody = 64 << 10
+ 
+ // Authorize decides r for the token's user login (its lower-case name). The
+@@ -186,13 +234,59 @@ func (d *Delegation) Authorize(r *http.Request, login, apiPrefix string) error {
  			return fmt.Errorf("%w: %s/%s is not the token user's", ErrDenied, owner, repo)
  		}
  		return d.repository(r, owner, repo, sub)
@@ -324,10 +329,10 @@ index 178b9c1..e1e2d9f 100644
  	switch {
  	case m == http.MethodGet && len(sub) == 0, // the repository
  		m == http.MethodGet && len(sub) == 2 && sub[0] == "branches",
-@@ -242,6 +336,34 @@ func (d *Delegation) repository(r *http.Request, owner, repo string, sub []strin
- 			}
+@@ -204,6 +298,34 @@ func (d *Delegation) repository(r *http.Request, owner, repo string, sub []strin
+ 		if d.find(TypeRepository, owner, repo, "seed") != nil {
+ 			return nil
  		}
- 		return nil
 +	case m == http.MethodGet && len(sub) == 1 && sub[0] == "keys":
 +		if d.find(TypeDeployKey, owner, repo, "configure") != nil {
 +			return nil
@@ -360,10 +365,10 @@ index 178b9c1..e1e2d9f 100644
  	return fmt.Errorf("%w: %s %s", ErrDenied, m, r.URL.Path)
  }
 diff --git a/services/auth/pathops/pathops_test.go b/services/auth/pathops/pathops_test.go
-index 19bcaf7..1f98b0a 100644
+index 4ed19a5..eaa4e82 100644
 --- a/services/auth/pathops/pathops_test.go
 +++ b/services/auth/pathops/pathops_test.go
-@@ -156,3 +156,172 @@ func TestParse(t *testing.T) {
+@@ -148,3 +148,172 @@ func TestParse(t *testing.T) {
  		assert.Error(t, err, name)
  	}
  }
@@ -530,7 +535,7 @@ index 19bcaf7..1f98b0a 100644
 +		"key unknown action":          with(key, "actions", []string{"delete"}),
 +		"key with token scopes":       with(key, "scopes", []string{RepositoryTokenScope}),
 +		"repository with key title":   with(repo("app-a", "read"), "title", "x"),
-+		"webhook with token name":     with(webhook("app-a"), "name", resolution),
++		"token with a webhook url":    with(tok, "url", hook),
 +	} {
 +		_, err := Parse(map[string]any{"authorization_details": []any{detail}})
 +		assert.Error(t, err, name)

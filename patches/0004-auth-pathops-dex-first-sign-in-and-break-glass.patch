@@ -1,4 +1,4 @@
-From ab7b0f1497e24c506fc459a4602e15ce61b20c42 Mon Sep 17 00:00:00 2001
+From bf4044b08b5c9b95337c736755b54dda85b7f845 Mon Sep 17 00:00:00 2001
 From: PathOps <noreply@pathops.dev>
 Date: Wed, 11 Nov 2026 18:16:26 -0300
 Subject: [PATCH] auth: PathOps Dex-first sign-in with a local break-glass

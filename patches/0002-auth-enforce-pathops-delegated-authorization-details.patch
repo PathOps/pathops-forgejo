@@ -1,8 +1,8 @@
-From c0df126dc052ad29b558d8ac2574f64c84cfc6de Mon Sep 17 00:00:00 2001
+From 5fdad0593e8c957b2d569ecbc16989aefc01d76e Mon Sep 17 00:00:00 2001
 From: PathOps <noreply@pathops.dev>
 Date: Tue, 3 Nov 2026 09:33:14 -0300
-Subject: [PATCH 2/2] auth: enforce PathOps delegated authorization_details on
- the API
+Subject: [PATCH] auth: enforce PathOps delegated authorization_details on the
+ API
 
 Tokens of the configured PathOps delegation issuer
 ([authorized_integration] PATHOPS_DELEGATION_ISSUER) are tokens the PathOps
@@ -15,23 +15,23 @@ the boundary; their RAR authorization_details are:
   equality rules, its azp is PATHOPS_DELEGATION_AUTHORIZED_PARTY, and the
   request is an API v1 request (never web, git, LFS or packages);
 - its authorization_details must parse as the PathOps forgejo vocabulary
-  (pathops_repository create/seed, pathops_webhook configure);
+  (pathops_repository create/seed);
 - every API request is then allowed only when a detail authorizes exactly
-  its action on its owner/repository (and, for webhooks, its target URL and
-  events); anything else gets 403 before a handler runs.
+  its action on its owner/repository; anything else gets 403 before a
+  handler runs. No detail authorizes a repository webhook (PathOps
+  Decision 0070: a Delivery is an explicit request to the Tenant CP).
 
-A token for gaston/app-a cannot create, read or change gaston/app-b, a
-repository token cannot touch webhooks and a webhook token cannot create or
-delete repositories. Without the setting, behavior is unchanged.
+A token for gaston/app-a cannot create, read or change gaston/app-b, and no
+token can touch webhooks. Without the setting, behavior is unchanged.
 ---
  modules/setting/authorized_integration.go     |  11 +
  routers/api/shared/middleware.go              |  15 +
  .../auth_result_authorized_integration.go     |   8 +
  .../auth/method/authorized_integration.go     |  41 +++
- .../authorized_integration_pathops_test.go    |  87 +++++
- services/auth/pathops/pathops.go              | 309 ++++++++++++++++++
- services/auth/pathops/pathops_test.go         | 158 +++++++++
- 7 files changed, 629 insertions(+)
+ .../authorized_integration_pathops_test.go    |  87 ++++++
+ services/auth/pathops/pathops.go              | 271 ++++++++++++++++++
+ services/auth/pathops/pathops_test.go         | 150 ++++++++++
+ 7 files changed, 583 insertions(+)
  create mode 100644 services/auth/method/authorized_integration_pathops_test.go
  create mode 100644 services/auth/pathops/pathops.go
  create mode 100644 services/auth/pathops/pathops_test.go
@@ -292,10 +292,10 @@ index 0000000..9fa42c1
 +}
 diff --git a/services/auth/pathops/pathops.go b/services/auth/pathops/pathops.go
 new file mode 100644
-index 0000000..178b9c1
+index 0000000..306318f
 --- /dev/null
 +++ b/services/auth/pathops/pathops.go
-@@ -0,0 +1,309 @@
+@@ -0,0 +1,271 @@
 +// Copyright 2026 The PathOps Authors. All rights reserved.
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
@@ -315,7 +315,6 @@ index 0000000..178b9c1
 +// Detail vocabulary v1 (tool "forgejo"):
 +//
 +//	pathops_repository  owner, repository, actions create|seed
-+//	pathops_webhook     owner, repository, url, events, actions configure
 +//
 +// API calls allowed (owner must be the token's user):
 +//
@@ -324,10 +323,9 @@ index 0000000..178b9c1
 +//	GET  /repos/{o}/{r}, .../branches/{b},      repository create or seed of r
 +//	     .../git/trees/{sha}
 +//	POST /repos/{o}/{r}/contents                repository seed of r
-+//	GET  /repos/{o}/{r}/hooks                   webhook configure of r
-+//	POST /repos/{o}/{r}/hooks {config.url,      webhook configure of r: the url,
-+//	     events}                                and events among the detail's
-+//	PATCH /repos/{o}/{r}/hooks/{id} {same}      same
++//
++// No detail authorizes a repository webhook (PathOps Decision 0070: a
++// Delivery is an explicit request to the Tenant CP, never a push).
 +package pathops
 +
 +import (
@@ -346,7 +344,6 @@ index 0000000..178b9c1
 +// Detail types and actions of vocabulary v1.
 +const (
 +	TypeRepository = "pathops_repository"
-+	TypeWebhook    = "pathops_webhook"
 +	Tool           = "forgejo"
 +)
 +
@@ -357,8 +354,6 @@ index 0000000..178b9c1
 +	Tool       string   `json:"tool"`
 +	Owner      string   `json:"owner"`
 +	Repository string   `json:"repository"`
-+	URL        string   `json:"url,omitempty"`
-+	Events     []string `json:"events,omitempty"`
 +	Actions    []string `json:"actions"`
 +}
 +
@@ -376,7 +371,6 @@ index 0000000..178b9c1
 +
 +var allowed = map[string][]string{
 +	TypeRepository: {"create", "seed"},
-+	TypeWebhook:    {"configure"},
 +}
 +
 +// Parse reads and validates the PathOps claims of a token: azp and a
@@ -428,10 +422,6 @@ index 0000000..178b9c1
 +		return errors.New("pathops delegation: detail owner/repository invalid")
 +	case len(dt.Actions) == 0:
 +		return errors.New("pathops delegation: detail without actions")
-+	case dt.Type == TypeWebhook && (dt.URL == "" || len(dt.Events) == 0):
-+		return errors.New("pathops delegation: webhook detail without url or events")
-+	case dt.Type == TypeRepository && (dt.URL != "" || len(dt.Events) != 0):
-+		return errors.New("pathops delegation: repository detail with webhook fields")
 +	}
 +	for _, a := range dt.Actions {
 +		if !slices.Contains(acts, a) {
@@ -451,8 +441,8 @@ index 0000000..178b9c1
 +	return nil
 +}
 +
-+// maxBody bounds the request bodies read for a decision (repository and
-+// webhook creation are small).
++// maxBody bounds the request bodies read for a decision (a repository
++// creation is small).
 +const maxBody = 64 << 10
 +
 +// Authorize decides r for the token's user login (its lower-case name). The
@@ -512,34 +502,6 @@ index 0000000..178b9c1
 +		if d.find(TypeRepository, owner, repo, "seed") != nil {
 +			return nil
 +		}
-+	case m == http.MethodGet && len(sub) == 1 && sub[0] == "hooks":
-+		if d.find(TypeWebhook, owner, repo, "configure") != nil {
-+			return nil
-+		}
-+	case (m == http.MethodPost && len(sub) == 1 && sub[0] == "hooks") ||
-+		(m == http.MethodPatch && len(sub) == 2 && sub[0] == "hooks"):
-+		dt := d.find(TypeWebhook, owner, repo, "configure")
-+		if dt == nil {
-+			break
-+		}
-+		var body struct {
-+			Config struct {
-+				URL string `json:"url"`
-+			} `json:"config"`
-+			Events []string `json:"events"`
-+		}
-+		if err := readJSON(r, &body); err != nil {
-+			return err
-+		}
-+		if body.Config.URL != dt.URL {
-+			return fmt.Errorf("%w: webhook url of %s/%s", ErrDenied, owner, repo)
-+		}
-+		for _, e := range body.Events {
-+			if !slices.Contains(dt.Events, e) {
-+				return fmt.Errorf("%w: webhook event %q of %s/%s", ErrDenied, e, owner, repo)
-+			}
-+		}
-+		return nil
 +	}
 +	return fmt.Errorf("%w: %s %s", ErrDenied, m, r.URL.Path)
 +}
@@ -607,10 +569,10 @@ index 0000000..178b9c1
 +}
 diff --git a/services/auth/pathops/pathops_test.go b/services/auth/pathops/pathops_test.go
 new file mode 100644
-index 0000000..19bcaf7
+index 0000000..4ed19a5
 --- /dev/null
 +++ b/services/auth/pathops/pathops_test.go
-@@ -0,0 +1,158 @@
+@@ -0,0 +1,150 @@
 +// Copyright 2026 The PathOps Authors. All rights reserved.
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
@@ -629,15 +591,11 @@ index 0000000..19bcaf7
 +	"github.com/stretchr/testify/require"
 +)
 +
-+const hook = "http://tenant-control-plane.tenant-control-plane.svc:8080/api/v1/webhooks/forgejo/app-a-id"
++// No detail authorizes a webhook (PathOps Decision 0070).
++const hook = "https://control-plane.cell.example/api/v1/webhooks/forgejo/app-a-id"
 +
 +func repo(name string, actions ...string) map[string]any {
 +	return map[string]any{"type": TypeRepository, "version": 1, "tool": "forgejo", "owner": "gaston", "repository": name, "actions": actions}
-+}
-+
-+func webhook(name string) map[string]any {
-+	return map[string]any{"type": TypeWebhook, "version": 1, "tool": "forgejo", "owner": "gaston", "repository": name,
-+		"url": hook, "events": []string{"push"}, "actions": []string{"configure"}}
 +}
 +
 +func delegation(t *testing.T, details ...map[string]any) *Delegation {
@@ -719,25 +677,21 @@ index 0000000..19bcaf7
 +	}
 +}
 +
-+func TestWebhookToken(t *testing.T) {
-+	d := delegation(t, webhook("app-a"))
-+	assert.NoError(t, call(d, "GET", "/api/v1/repos/gaston/app-a/hooks?limit=50", ""))
-+	assert.NoError(t, call(d, "POST", "/api/v1/repos/gaston/app-a/hooks",
-+		`{"type":"forgejo","active":true,"events":["push"],"config":{"url":"`+hook+`","content_type":"json","secret":"s"}}`))
-+	assert.NoError(t, call(d, "PATCH", "/api/v1/repos/gaston/app-a/hooks/7", `{"active":true,"events":["push"],"config":{"url":"`+hook+`"}}`))
++// Neither the former webhook detail nor its fields authorize anything: a
++// token with them is refused; a repository token never reaches the hooks.
++func TestNoWebhookAuthority(t *testing.T) {
++	d := delegation(t, repo("app-a", "create", "seed"))
 +	for _, c := range []struct{ method, path, body string }{
-+		{"POST", "/api/v1/user/repos", `{"name":"app-a"}`},
-+		{"DELETE", "/api/v1/repos/gaston/app-a", ""},
-+		{"POST", "/api/v1/repos/gaston/app-a/contents", `{}`},
-+		{"GET", "/api/v1/repos/gaston/app-a", ""},
++		{"GET", "/api/v1/repos/gaston/app-a/hooks?limit=50", ""},
++		{"POST", "/api/v1/repos/gaston/app-a/hooks", `{"type":"forgejo","active":true,"events":["push"],"config":{"url":"` + hook + `"}}`},
++		{"PATCH", "/api/v1/repos/gaston/app-a/hooks/7", `{"active":true,"events":["push"],"config":{"url":"` + hook + `"}}`},
 +		{"DELETE", "/api/v1/repos/gaston/app-a/hooks/7", ""},
-+		{"POST", "/api/v1/repos/gaston/app-a/hooks", `{"config":{"url":"https://evil.example/collect"}}`},
-+		{"POST", "/api/v1/repos/gaston/app-a/hooks", `{"events":["push","issues"],"config":{"url":"` + hook + `"}}`},
-+		{"POST", "/api/v1/repos/gaston/app-a/hooks", `{"config":{"url":"` + hook + `","URL":"https://evil.example"}}`},
-+		{"POST", "/api/v1/repos/gaston/app-b/hooks", `{"config":{"url":"` + hook + `"}}`},
 +	} {
 +		assert.ErrorIs(t, call(d, c.method, c.path, c.body), ErrDenied, "%s %s %s", c.method, c.path, c.body)
 +	}
++	_, err := Parse(map[string]any{"authorization_details": []any{map[string]any{"type": "pathops_webhook", "version": 1, "tool": "forgejo",
++		"owner": "gaston", "repository": "app-a", "url": hook, "events": []any{"push"}, "actions": []any{"configure"}}}})
++	assert.Error(t, err)
 +}
 +
 +func TestParse(t *testing.T) {
@@ -753,17 +707,17 @@ index 0000000..19bcaf7
 +	assert.Len(t, d.Details, 1)
 +
 +	for name, claims := range map[string]map[string]any{
-+		"no details":        {"azp": "x"},
-+		"not an array":      {"authorization_details": "x"},
-+		"only other tools":  {"authorization_details": []any{tekton}},
-+		"unknown type":      {"authorization_details": []any{map[string]any{"type": "pathops_admin", "version": 1, "tool": "forgejo", "owner": "g", "repository": "r", "actions": []any{"all"}}}},
-+		"unknown action":    {"authorization_details": []any{repo("app-a", "delete")}},
-+		"unknown field":     {"authorization_details": []any{map[string]any{"type": TypeRepository, "version": 1, "tool": "forgejo", "owner": "g", "repository": "r", "actions": []any{"seed"}, "admin": true}}},
-+		"wildcard repo":     {"authorization_details": []any{repo("*", "create")}},
-+		"webhook no url":    {"authorization_details": []any{map[string]any{"type": TypeWebhook, "version": 1, "tool": "forgejo", "owner": "g", "repository": "r", "events": []any{"push"}, "actions": []any{"configure"}}}},
-+		"version 2":         {"authorization_details": []any{map[string]any{"type": TypeRepository, "version": 2, "tool": "forgejo", "owner": "g", "repository": "r", "actions": []any{"seed"}}}},
-+		"no actions":        {"authorization_details": []any{repo("app-a")}},
-+		"repo with webhook": {"authorization_details": []any{map[string]any{"type": TypeRepository, "version": 1, "tool": "forgejo", "owner": "g", "repository": "r", "url": "u", "actions": []any{"seed"}}}},
++		"no details":       {"azp": "x"},
++		"not an array":     {"authorization_details": "x"},
++		"only other tools": {"authorization_details": []any{tekton}},
++		"unknown type":     {"authorization_details": []any{map[string]any{"type": "pathops_admin", "version": 1, "tool": "forgejo", "owner": "g", "repository": "r", "actions": []any{"all"}}}},
++		"unknown action":   {"authorization_details": []any{repo("app-a", "delete")}},
++		"unknown field":    {"authorization_details": []any{map[string]any{"type": TypeRepository, "version": 1, "tool": "forgejo", "owner": "g", "repository": "r", "actions": []any{"seed"}, "admin": true}}},
++		"wildcard repo":    {"authorization_details": []any{repo("*", "create")}},
++		"webhook type":     {"authorization_details": []any{map[string]any{"type": "pathops_webhook", "version": 1, "tool": "forgejo", "owner": "g", "repository": "r", "actions": []any{"configure"}}}},
++		"version 2":        {"authorization_details": []any{map[string]any{"type": TypeRepository, "version": 2, "tool": "forgejo", "owner": "g", "repository": "r", "actions": []any{"seed"}}}},
++		"no actions":       {"authorization_details": []any{repo("app-a")}},
++		"repo with a url":  {"authorization_details": []any{map[string]any{"type": TypeRepository, "version": 1, "tool": "forgejo", "owner": "g", "repository": "r", "url": "u", "actions": []any{"seed"}}}},
 +	} {
 +		_, err := Parse(claims)
 +		assert.Error(t, err, name)

@@ -70,7 +70,9 @@ A token whose `iss` is `PATHOPS_DELEGATION_ISSUER` is accepted only when:
   `forgejo` detail; details of other tools are ignored here).
 
 Each API request is then authorized against the details **before any handler
-runs**; anything not listed is `403`:
+runs**; anything not listed is `403` (no detail authorizes a repository
+webhook: a PathOps Delivery is an explicit request to the Tenant CP, PathOps
+Decision 0070):
 
 | Request | Needs |
 |---|---|
@@ -78,8 +80,6 @@ runs**; anything not listed is `403`:
 | `POST /user/repos` `{name}` | `pathops_repository` `create` of `name` (owner = the token's user) |
 | `GET /repos/{o}/{r}`, `.../branches/{b}`, `.../git/trees/{sha}` | `pathops_repository` `create`, `seed` or `read` of `o/r` |
 | `POST /repos/{o}/{r}/contents` | `pathops_repository` `seed` of `o/r` |
-| `GET /repos/{o}/{r}/hooks` | `pathops_webhook` `configure` of `o/r` |
-| `POST /repos/{o}/{r}/hooks`, `PATCH .../hooks/{id}` | `pathops_webhook` `configure` of `o/r`, with exactly its `url` and events among its `events` |
 | `GET /users/{o}/tokens` | any `pathops_repository_token` |
 | `POST /users/{o}/tokens` `{name, scopes, repositories}` | `pathops_repository_token` `create`: exactly its `name`, its `scopes` (`["read:repository"]`) and the one repository `o/r` |
 | `DELETE /users/{o}/tokens/{name}` | `pathops_repository_token` `revoke` of that exact name (never an id) |
@@ -91,9 +91,6 @@ Detail vocabulary v1:
 ```json
 {"type": "pathops_repository", "version": 1, "tool": "forgejo",
  "owner": "gaston", "repository": "app-a", "actions": ["create", "seed"]}
-{"type": "pathops_webhook", "version": 1, "tool": "forgejo",
- "owner": "gaston", "repository": "app-a", "url": "http://.../webhooks/forgejo/<app id>",
- "events": ["push"], "actions": ["configure"]}
 {"type": "pathops_repository_token", "version": 1, "tool": "forgejo",
  "owner": "gaston", "repository": "app-a", "name": "pathops-resolution-<app id>",
  "scopes": ["read:repository"], "actions": ["create", "revoke"]}

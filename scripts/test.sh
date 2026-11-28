@@ -38,9 +38,9 @@ go test -tags "$TAGS" "${packages[@]}"
 
 echo "test: PathOps tests"
 out=$(go test -tags "$TAGS" -count=1 -v ./services/auth/pathops/ ./services/auth/method/ ./routers/api/v1/permissions/ \
-  -run 'PathOps|TestSourceRepositoryToken|TestWebhookToken|TestParse|TestRepositoryTokenDetail|TestDeployKeyDetail|TestRepositoryRead')
+  -run 'PathOps|TestSourceRepositoryToken|TestNoWebhookAuthority|TestParse|TestRepositoryTokenDetail|TestDeployKeyDetail|TestRepositoryRead')
 echo "$out" | grep -E -- '^--- (PASS|FAIL)'
-for t in TestSourceRepositoryToken TestWebhookToken TestParse TestAuthorizedIntegrationPathOps \
+for t in TestSourceRepositoryToken TestNoWebhookAuthority TestParse TestAuthorizedIntegrationPathOps \
   TestRepositoryTokenDetail TestDeployKeyDetail TestRepositoryRead TestParseRepositoryTokenAndDeployKey \
   TestReqBasicOrRevProxyAuthPathOps; do
   grep -q -- "--- PASS: $t " <<<"$out" || {
